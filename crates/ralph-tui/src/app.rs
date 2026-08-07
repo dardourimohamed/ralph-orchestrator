@@ -101,7 +101,13 @@ pub fn dispatch_action(action: Action, state: &mut TuiState, viewport_height: us
             }
         }
         Action::StartSearch => {
+            // Enter input mode with an empty query so the footer shows the
+            // "Search: " prompt immediately; characters are captured by
+            // `handle_search_input` while `search_mode` is active.
             state.search_state.search_mode = true;
+            state.search_state.query = Some(String::new());
+            state.search_state.matches.clear();
+            state.search_state.current_match = 0;
         }
         Action::SearchNext => {
             state.next_match();
@@ -121,9 +127,69 @@ pub fn dispatch_action(action: Action, state: &mut TuiState, viewport_height: us
         Action::ToggleMouseMode => {
             state.mouse_capture_enabled = !state.mouse_capture_enabled;
         }
+        Action::ExportCurrentIteration => {
+            state.export_current_iteration_to_disk();
+        }
+        Action::ExportAllIterations => {
+            state.export_all_iterations_to_disk();
+        }
         Action::None => {}
     }
     false
+}
+
+/// Handles a key press while search input mode is active.
+///
+/// While `search_state.search_mode` is true, every key is captured here
+/// (the caller must `continue` instead of mapping the key to an action) so
+/// that typing a query does not leak through to normal keybindings.
+///
+/// - `Char`/`Backspace`: edit the query and live-update matches.
+/// - `Enter`: commit a non-empty query (leaving `query`/`matches` intact so
+///   `n`/`N` can navigate); an empty query clears the search.
+/// - `Esc`: cancel and clear the search.
+///
+/// Returns `true` when the key was consumed (search mode was active).
+fn handle_search_input(state: &mut TuiState, code: crossterm::event::KeyCode) -> bool {
+    use crossterm::event::KeyCode;
+
+    if !state.search_state.search_mode {
+        return false;
+    }
+
+    match code {
+        KeyCode::Esc => {
+            state.clear_search();
+        }
+        KeyCode::Enter => {
+            let has_query = state
+                .search_state
+                .query
+                .as_deref()
+                .is_some_and(|q| !q.is_empty());
+            if has_query {
+                // Commit the search: leave the input mode but keep the query
+                // and matches so `n`/`N` navigate the highlighted results.
+                state.search_state.search_mode = false;
+            } else {
+                state.clear_search();
+            }
+        }
+        KeyCode::Backspace => {
+            // `search` preserves `search_mode`, so the user stays in input mode.
+            let mut query = state.search_state.query.clone().unwrap_or_default();
+            query.pop();
+            state.search(&query);
+        }
+        KeyCode::Char(c) => {
+            let mut query = state.search_state.query.clone().unwrap_or_default();
+            query.push(c);
+            state.search(&query);
+        }
+        _ => {}
+    }
+
+    true
 }
 
 fn set_mouse_capture(enabled: bool) -> Result<()> {
@@ -334,6 +400,14 @@ impl<W: AsyncWrite + Unpin + Send + 'static> App<W> {
                                         }
                                     }
 
+                                    // Search input mode: capture all keys into the query
+                                    {
+                                        let mut state = self.state.lock().unwrap();
+                                        if handle_search_input(&mut state, key.code) {
+                                            continue;
+                                        }
+                                    }
+
                                     // Dismiss help on any key when help is showing
                                     {
                                         let mut state = self.state.lock().unwrap();
@@ -391,6 +465,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> App<W> {
 
                     // Clear expired flash messages (e.g., guidance send confirmation)
                     state.clear_expired_guidance_flash();
+                    state.clear_expired_export_flash();
 
                     // Autoscroll: if user hasn't scrolled away, keep them at the bottom
                     // as new content arrives. This mimics standard terminal behavior.
@@ -456,7 +531,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> App<W> {
 mod tests {
     use super::*;
     use crate::input::{Action, map_key};
-    use crate::state::TuiState;
+    use crate::state::{ExportOutcome, TuiState};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::text::Line;
 
@@ -631,6 +706,143 @@ mod tests {
     }
 
     // =========================================================================
+    // Search input mode: keys must be captured into the query, not dispatched
+    // as normal keybindings (regression: typing a query containing 'e' fired
+    // the export action because no interception block existed).
+    // =========================================================================
+
+    fn seed_search_state() -> TuiState {
+        let mut state = TuiState::new();
+        state.start_new_iteration();
+        let buffer = state.current_iteration_mut().unwrap();
+        buffer.append_line(Line::from("reviewing changes"));
+        buffer.append_line(Line::from("reviewing more"));
+        buffer.append_line(Line::from("done"));
+        state
+    }
+
+    #[test]
+    fn start_search_enters_input_mode_with_empty_query() {
+        let mut state = seed_search_state();
+
+        dispatch_action(Action::StartSearch, &mut state, 10);
+
+        assert!(state.search_state.search_mode, "'/' must enter input mode");
+        assert_eq!(
+            state.search_state.query.as_deref(),
+            Some(""),
+            "query prompt should start empty so the footer shows 'Search: '"
+        );
+    }
+
+    #[test]
+    fn typed_chars_build_query_and_do_not_dispatch_actions() {
+        let mut state = seed_search_state();
+        dispatch_action(Action::StartSearch, &mut state, 10);
+
+        // Type "review" — note this includes 'e', which previously fell through
+        // to Action::ExportCurrentIteration.
+        for c in "review".chars() {
+            assert!(
+                handle_search_input(&mut state, KeyCode::Char(c)),
+                "search mode must consume '{c}'"
+            );
+        }
+
+        assert_eq!(state.search_state.query.as_deref(), Some("review"));
+        assert!(
+            !state.search_state.matches.is_empty(),
+            "live search should find 'review' matches while typing"
+        );
+        assert!(
+            state.export_flash.is_none(),
+            "typing a query must NOT trigger the export action"
+        );
+    }
+
+    #[test]
+    fn backspace_edits_query_live() {
+        let mut state = seed_search_state();
+        dispatch_action(Action::StartSearch, &mut state, 10);
+        for c in "reviewx".chars() {
+            handle_search_input(&mut state, KeyCode::Char(c));
+        }
+        assert!(
+            state.search_state.matches.is_empty(),
+            "'reviewx' has no match"
+        );
+
+        handle_search_input(&mut state, KeyCode::Backspace);
+
+        assert_eq!(state.search_state.query.as_deref(), Some("review"));
+        assert!(
+            !state.search_state.matches.is_empty(),
+            "backspace should re-run search and restore matches"
+        );
+    }
+
+    #[test]
+    fn enter_commits_query_and_keeps_results_for_navigation() {
+        let mut state = seed_search_state();
+        dispatch_action(Action::StartSearch, &mut state, 10);
+        for c in "reviewing".chars() {
+            handle_search_input(&mut state, KeyCode::Char(c));
+        }
+
+        assert!(handle_search_input(&mut state, KeyCode::Enter));
+
+        assert!(
+            !state.search_state.search_mode,
+            "Enter exits input mode so n/N dispatch as navigation"
+        );
+        assert_eq!(
+            state.search_state.query.as_deref(),
+            Some("reviewing"),
+            "committed query is kept for the footer display"
+        );
+        let matches = state.search_state.matches.len();
+        assert!(matches >= 2, "two lines contain 'reviewing'");
+
+        // n/N now dispatch normally and navigate the committed results.
+        assert!(!handle_search_input(&mut state, KeyCode::Char('n')));
+        dispatch_action(Action::SearchNext, &mut state, 10);
+        assert_eq!(state.search_state.current_match, 1);
+    }
+
+    #[test]
+    fn enter_on_empty_query_clears_search() {
+        let mut state = seed_search_state();
+        dispatch_action(Action::StartSearch, &mut state, 10);
+
+        handle_search_input(&mut state, KeyCode::Enter);
+
+        assert!(!state.search_state.search_mode);
+        assert!(state.search_state.query.is_none(), "empty query is cleared");
+    }
+
+    #[test]
+    fn esc_cancels_search_input() {
+        let mut state = seed_search_state();
+        dispatch_action(Action::StartSearch, &mut state, 10);
+        for c in "review".chars() {
+            handle_search_input(&mut state, KeyCode::Char(c));
+        }
+
+        assert!(handle_search_input(&mut state, KeyCode::Esc));
+
+        assert!(!state.search_state.search_mode);
+        assert!(state.search_state.query.is_none());
+        assert!(state.search_state.matches.is_empty());
+    }
+
+    #[test]
+    fn handle_search_input_is_noop_when_not_searching() {
+        let mut state = seed_search_state();
+        // Not in search mode: the helper must not consume the key.
+        assert!(!handle_search_input(&mut state, KeyCode::Char('e')));
+    }
+
+    // =========================================================================
     // AC5: Quit Returns True to Exit Loop
     // =========================================================================
 
@@ -662,6 +874,89 @@ mod tests {
 
         dispatch_action(Action::ToggleMouseMode, &mut state, 10);
         assert!(!state.mouse_capture_enabled);
+    }
+
+    #[test]
+    fn dispatch_action_export_current_writes_current_iteration_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut state = TuiState::new();
+        state.set_export_workspace_root(temp_dir.path());
+        state.start_new_iteration_with_metadata(Some("Builder".to_string()), Some("codex".into()));
+        state
+            .current_iteration_mut()
+            .unwrap()
+            .append_line(Line::from("current only"));
+
+        let should_quit = dispatch_action(Action::ExportCurrentIteration, &mut state, 10);
+
+        assert!(!should_quit);
+        let path = match &state.export_flash.as_ref().unwrap().outcome {
+            ExportOutcome::Success { path } => path.clone(),
+            ExportOutcome::Failed { message } => panic!("export failed: {message}"),
+        };
+        assert!(path.starts_with(temp_dir.path().join(".ralph/tui-exports")));
+        assert!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ralph-tui-current-"))
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("Iteration 1"));
+        assert!(text.contains("Hat: Builder"));
+        assert!(text.contains("Backend: codex"));
+        assert!(text.contains("current only"));
+    }
+
+    #[test]
+    fn dispatch_action_export_all_writes_single_file_with_all_iterations() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut state = TuiState::new();
+        state.set_export_workspace_root(temp_dir.path());
+        state.start_new_iteration();
+        state
+            .current_iteration_mut()
+            .unwrap()
+            .append_line(Line::from("iteration one"));
+        state.start_new_iteration();
+        state
+            .current_iteration_mut()
+            .unwrap()
+            .append_line(Line::from("iteration two"));
+
+        dispatch_action(Action::ExportAllIterations, &mut state, 10);
+
+        let path = match &state.export_flash.as_ref().unwrap().outcome {
+            ExportOutcome::Success { path } => path.clone(),
+            ExportOutcome::Failed { message } => panic!("export failed: {message}"),
+        };
+        assert!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ralph-tui-all-"))
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("Iterations: 2"));
+        assert!(text.contains("Iteration 1"));
+        assert!(text.contains("iteration one"));
+        assert!(text.contains("Iteration 2"));
+        assert!(text.contains("iteration two"));
+    }
+
+    #[test]
+    fn dispatch_action_export_all_without_iterations_sets_failure_status() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut state = TuiState::new();
+        state.set_export_workspace_root(temp_dir.path());
+
+        dispatch_action(Action::ExportAllIterations, &mut state, 10);
+
+        match &state.export_flash.as_ref().unwrap().outcome {
+            ExportOutcome::Success { path } => panic!("unexpected export at {}", path.display()),
+            ExportOutcome::Failed { message } => {
+                assert!(message.contains("no iteration buffers to export"));
+            }
+        }
+        assert!(!temp_dir.path().join(".ralph/tui-exports").exists());
     }
 
     // =========================================================================

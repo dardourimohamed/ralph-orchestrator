@@ -41,6 +41,7 @@ mod test_support;
 mod tools;
 mod wave;
 mod web;
+mod web_robot_service;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -709,7 +710,7 @@ enum Commands {
 /// Arguments for the init subcommand.
 #[derive(Parser, Debug)]
 struct InitArgs {
-    /// Backend to use (claude, kiro, gemini, codex, amp, copilot, opencode, pi, custom).
+    /// Backend to use (claude, kiro, gemini, codex, forge, amp, copilot, opencode, pi, custom).
     /// Generates core config only.
     #[arg(long, conflicts_with = "list_presets")]
     backend: Option<String>,
@@ -917,6 +918,11 @@ struct CleanArgs {
     /// Clean diagnostic logs instead of `.ralph/` directory
     #[arg(long)]
     diagnostics: bool,
+
+    /// Clean event run history (`.ralph/events*.jsonl` + `current-events` marker)
+    /// instead of the agent directory
+    #[arg(long, conflicts_with = "diagnostics")]
+    events: bool,
 }
 
 /// Arguments for the emit subcommand.
@@ -2410,6 +2416,12 @@ fn clean_command(
     if args.diagnostics {
         let workspace_root = std::env::current_dir().context("Failed to get current directory")?;
         return ralph_cli::clean_diagnostics(&workspace_root, use_colors, args.dry_run);
+    }
+
+    // If --events flag is set, clean event run history only
+    if args.events {
+        let workspace_root = std::env::current_dir().context("Failed to get current directory")?;
+        return ralph_cli::clean_events(&workspace_root, use_colors, args.dry_run);
     }
 
     // Load config with overrides applied

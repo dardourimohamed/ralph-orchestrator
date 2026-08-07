@@ -160,6 +160,9 @@ pub enum RpcEvent {
         max_iterations: Option<u32>,
         /// Backend being used.
         backend: String,
+        /// Workspace root for the loop emitting this event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<String>,
         /// Unix timestamp (milliseconds) when the loop started.
         started_at: u64,
     },
@@ -196,6 +199,10 @@ pub enum RpcEvent {
         cache_read_tokens: u64,
         /// Cache write tokens.
         cache_write_tokens: u64,
+        /// Resolved context-window ceiling (tokens). `0` when unknown.
+        context_window: u64,
+        /// Context tokens occupied (`input + cache_read + cache_write`).
+        context_tokens: u64,
         /// Whether this iteration triggered LOOP_COMPLETE.
         loop_complete_triggered: bool,
     },
@@ -649,6 +656,7 @@ mod tests {
             prompt: "test prompt".to_string(),
             max_iterations: Some(10),
             backend: "claude".to_string(),
+            workspace_root: Some("/tmp/ralph-workspace".to_string()),
             started_at: 1_700_000_000_000,
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -681,6 +689,8 @@ mod tests {
             output_tokens: 500,
             cache_read_tokens: 7500,
             cache_write_tokens: 100,
+            context_window: 200_000,
+            context_tokens: 15_600,
             loop_complete_triggered: false,
         };
         let json = serde_json::to_string(&event).unwrap();

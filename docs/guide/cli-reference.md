@@ -115,7 +115,7 @@ ralph init [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--backend <NAME>` | Backend: `claude`, `kiro`, `gemini`, `codex`, `amp`, `copilot`, `opencode`, `pi`, `custom` |
+| `--backend <NAME>` | Backend: `claude`, `kiro`, `gemini`, `codex`, `forge`, `amp`, `copilot`, `opencode`, `pi`, `custom` |
 | `--preset <NAME>` | Removed (monolithic presets no longer supported) |
 | `--list-presets` | List available built-in hat collections |
 | `--force` | Overwrite existing config |
@@ -262,7 +262,8 @@ ralph emit <TOPIC> [PAYLOAD] [OPTIONS]
 
 ### ralph clean
 
-Clean `.ralph/agent` scratchpad and memory state.
+By default, deletes the whole `.ralph/agent` directory — scratchpad, `memories.md`, and
+`tasks.jsonl` included. Use `--diagnostics` or `--events` to target run artifacts instead.
 
 ```bash
 ralph clean [OPTIONS]
@@ -272,8 +273,11 @@ ralph clean [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--diagnostics` | Clean diagnostics directory |
+| `--diagnostics` | Clean `.ralph/diagnostics` instead of the agent directory |
+| `--events` | Clean event run history: `.ralph/events.jsonl`, `.ralph/events-*.jsonl`, and the `.ralph/current-events` marker |
 | `--dry-run` | Preview deletions |
+
+`--diagnostics` and `--events` are mutually exclusive; run the command twice to clear both.
 
 ### ralph loops
 
@@ -295,12 +299,16 @@ ralph loops [OPTIONS] [COMMAND]
 - `prune`
 - `attach <loop-id>`
 - `diff <loop-id> [--stat]`
+- `publish-review <loop-id> [--remote <remote>] [--remote-branch <branch>] [--base <ref>] [--summary <path>]`
+- `rebase [loop-id] [--base <ref>] [--remote <remote>] [--no-fetch] [--push]`
 - `merge <loop-id> [--force]`
 - `process`
 - `merge-button-state <loop-id>`
 
 `ralph loops resume <loop-id>` writes a resume signal for suspended loops. It is idempotent:
 re-running the command reports that resume was already requested (or that the loop is not suspended).
+
+`ralph loops publish-review <loop-id>` pushes `ralph/<loop-id>` to a remote review branch and writes a local `.ralph/reviews/<loop-id>.md` summary. `ralph loops rebase` rebases one loop branch, or all queued/needs-review and non-running `ralph/*` worktree branches, onto the selected base without merging to that base.
 
 ### ralph hats
 
@@ -314,8 +322,21 @@ ralph hats [OPTIONS] [COMMAND]
 
 - `list [--format table|json]`
 - `show <name>`
-- `validate`
+- `validate [-i|--instructions]`
 - `graph [--format unicode|ascii|compact|mermaid] [--backend <backend>]`
+
+`validate` checks topology only: starting event has a subscriber, published
+events have subscribers, dead ends. `-i/--instructions` adds instruction sanity
+checks on top, scanning each hat's `instructions` plus `.ralph/agent/<hat-id>.md`
+(when that file exists) and warning about:
+
+- `emit <topic>` sites whose topic is not in that hat's `publishes`
+- backticked topics that belong to another hat (copy-paste leftovers)
+- hats with no instructions at all
+
+Instruction findings are always warnings, never errors — prose is advisory.
+Topics named in prose without backticks are ignored, as are backticked tokens
+that aren't topics anywhere in the config.
 
 ### ralph web
 

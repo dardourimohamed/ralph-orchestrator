@@ -182,7 +182,8 @@ pub struct RalphConfig {
     // These map to nested v2 fields for backwards compatibility.
     // ─────────────────────────────────────────────────────────────────────────
     /// V1 field: Backend CLI (maps to cli.backend).
-    /// Values: "claude", "kiro", "gemini", "codex", "amp", "pi", "auto", or "custom".
+    /// Values include "auto", "claude", "kiro", "kiro-acp", "gemini",
+    /// "codex", "forge", "amp", "copilot", "opencode", "pi", "roo", or "custom".
     #[serde(default)]
     pub agent: Option<String>,
 
@@ -816,7 +817,10 @@ impl RalphConfig {
     /// If empty, returns the default priority order.
     pub fn get_agent_priority(&self) -> Vec<&str> {
         if self.agent_priority.is_empty() {
-            vec!["claude", "kiro", "gemini", "codex", "amp"]
+            vec![
+                "claude", "kiro", "kiro-acp", "gemini", "codex", "forge", "amp", "copilot",
+                "opencode", "pi", "roo",
+            ]
         } else {
             self.agent_priority.iter().map(String::as_str).collect()
         }
@@ -942,6 +946,37 @@ pub struct EventLoopConfig {
     /// `{hat_id}.scope_violation` diagnostic events. Defaults to false (permissive).
     #[serde(default)]
     pub enforce_hat_scope: bool,
+
+    /// Context window size in tokens. When `None`, resolved from backend
+    /// default (claude/pi = 200_000; other backends = 0, which suppresses the
+    /// `Context:` display suffix). Set explicitly to override the default
+    /// (e.g. Sonnet 4.x `[1m]` users: `1_000_000`).
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+}
+
+/// Resolves the context-window ceiling in tokens for this run.
+///
+/// Precedence:
+/// 1. `event_loop.context_window_tokens` (explicit user override).
+/// 2. Backend default: `claude` | `pi` → `200_000`.
+/// 3. Unknown backends → `0` (suppresses the `Context:` suffix downstream).
+pub fn resolve_context_window(cfg: &RalphConfig) -> u64 {
+    resolve_context_window_for_backend(cfg, cfg.cli.backend.as_str())
+}
+
+/// Resolves the context-window ceiling for an already-selected backend.
+///
+/// Use this in hat execution paths where the effective backend may differ from
+/// `cli.backend` because of per-hat backend configuration.
+pub fn resolve_context_window_for_backend(cfg: &RalphConfig, backend: &str) -> u64 {
+    if let Some(n) = cfg.event_loop.context_window_tokens {
+        return n;
+    }
+    match backend {
+        "claude" | "pi" => 200_000,
+        _ => 0,
+    }
 }
 
 fn default_prompt_file() -> String {
@@ -982,6 +1017,7 @@ impl Default for EventLoopConfig {
             required_events: Vec::new(),
             cancellation_promise: String::new(),
             enforce_hat_scope: false,
+            context_window_tokens: None,
         }
     }
 }
@@ -1072,7 +1108,8 @@ impl CoreConfig {
 /// CLI backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
-    /// Backend to use: "claude", "kiro", "gemini", "codex", "amp", "pi", or "custom".
+    /// Backend to use: "auto", "claude", "kiro", "kiro-acp", "gemini",
+    /// "codex", "forge", "amp", "copilot", "opencode", "pi", "roo", or "custom".
     #[serde(default = "default_backend")]
     pub backend: String,
 
@@ -1936,17 +1973,41 @@ impl HatConfig {
     }
 }
 
+/// RObot communication channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RobotMode {
+    /// Use the Telegram-backed RObot service.
+    #[default]
+    Telegram,
+    /// Use JSON files in `.ralph/api/` for API-driven interaction.
+    Web,
+}
+
+impl RobotMode {
+    /// Returns true when the Telegram service should be used.
+    pub fn is_telegram(self) -> bool {
+        matches!(self, Self::Telegram)
+    }
+
+    /// Returns true when the file-backed web service should be used.
+    pub fn is_web(self) -> bool {
+        matches!(self, Self::Web)
+    }
+}
+
 /// RObot (Ralph-Orchestrator bot) configuration.
 ///
 /// Enables bidirectional communication between AI agents and humans
 /// during orchestration loops. When enabled, agents can emit `human.interact`
 /// events to request clarification (blocking the loop), and humans can
-/// send proactive guidance via Telegram.
+/// send proactive guidance.
 ///
 /// Example configuration:
 /// ```yaml
 /// RObot:
 ///   enabled: true
+///   mode: telegram
 ///   timeout_seconds: 300
 ///   checkin_interval_seconds: 120  # Optional: send status every 2 min
 ///   telegram:
@@ -1958,8 +2019,13 @@ pub struct RobotConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Communication channel to use. Defaults to Telegram for existing configs.
+    #[serde(default)]
+    pub mode: RobotMode,
+
     /// Timeout in seconds for waiting on human responses.
     /// Required when enabled (no default — must be explicit).
+    /// A value of 0 means wait indefinitely.
     pub timeout_seconds: Option<u64>,
 
     /// Interval in seconds between periodic check-in messages sent via Telegram.
@@ -1986,8 +2052,8 @@ impl RobotConfig {
             });
         }
 
-        // Bot token must be available from config, keychain, or env var
-        if self.resolve_bot_token().is_none() {
+        // Telegram mode needs a bot token from config, keychain, or env var.
+        if self.mode.is_telegram() && self.resolve_bot_token().is_none() {
             return Err(ConfigError::RobotMissingField {
                 field: "RObot.telegram.bot_token".to_string(),
                 hint: "Run `ralph bot onboard --telegram`, set RALPH_TELEGRAM_BOT_TOKEN env var, or set RObot.telegram.bot_token in config"
@@ -2152,6 +2218,68 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_context_window_explicit_override_wins() {
+        let mut config = RalphConfig::default();
+        config.cli.backend = "claude".to_string();
+        config.event_loop.context_window_tokens = Some(1_000_000);
+        assert_eq!(resolve_context_window(&config), 1_000_000);
+    }
+
+    #[test]
+    fn test_resolve_context_window_claude_default() {
+        let mut config = RalphConfig::default();
+        config.cli.backend = "claude".to_string();
+        config.event_loop.context_window_tokens = None;
+        assert_eq!(resolve_context_window(&config), 200_000);
+    }
+
+    #[test]
+    fn test_resolve_context_window_pi_default() {
+        let mut config = RalphConfig::default();
+        config.cli.backend = "pi".to_string();
+        config.event_loop.context_window_tokens = None;
+        assert_eq!(resolve_context_window(&config), 200_000);
+    }
+
+    #[test]
+    fn test_resolve_context_window_unknown_backend_is_zero() {
+        let mut config = RalphConfig::default();
+        config.cli.backend = "gemini".to_string();
+        config.event_loop.context_window_tokens = None;
+        assert_eq!(resolve_context_window(&config), 0);
+    }
+
+    #[test]
+    fn test_resolve_context_window_override_beats_unknown_backend() {
+        // Explicit override wins even for backends without a default window.
+        let mut config = RalphConfig::default();
+        config.cli.backend = "kiro".to_string();
+        config.event_loop.context_window_tokens = Some(128_000);
+        assert_eq!(resolve_context_window(&config), 128_000);
+    }
+
+    #[test]
+    fn test_resolve_context_window_for_effective_hat_backend() {
+        let mut config = RalphConfig::default();
+        config.cli.backend = "kiro".to_string();
+        config.event_loop.context_window_tokens = None;
+
+        assert_eq!(resolve_context_window(&config), 0);
+        assert_eq!(resolve_context_window_for_backend(&config, "pi"), 200_000);
+        assert_eq!(
+            resolve_context_window_for_backend(&config, "claude"),
+            200_000
+        );
+        assert_eq!(resolve_context_window_for_backend(&config, "gemini"), 0);
+
+        config.event_loop.context_window_tokens = Some(1_000_000);
+        assert_eq!(
+            resolve_context_window_for_backend(&config, "gemini"),
+            1_000_000
+        );
+    }
+
+    #[test]
     fn test_parse_yaml_with_custom_hats() {
         let yaml = r#"
 event_loop:
@@ -2240,7 +2368,13 @@ agent_priority: [gemini, claude, codex]
     fn test_default_agent_priority() {
         let config = RalphConfig::default();
         let priority = config.get_agent_priority();
-        assert_eq!(priority, vec!["claude", "kiro", "gemini", "codex", "amp"]);
+        assert_eq!(
+            priority,
+            vec![
+                "claude", "kiro", "kiro-acp", "gemini", "codex", "forge", "amp", "copilot",
+                "opencode", "pi", "roo"
+            ]
+        );
     }
 
     #[test]
@@ -3406,6 +3540,7 @@ hooks:
     fn test_robot_config_defaults_disabled() {
         let config = RalphConfig::default();
         assert!(!config.robot.enabled);
+        assert_eq!(config.robot.mode, RobotMode::Telegram);
         assert!(config.robot.timeout_seconds.is_none());
         assert!(config.robot.telegram.is_none());
     }
@@ -3418,6 +3553,7 @@ agent: claude
 ";
         let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(!config.robot.enabled);
+        assert_eq!(config.robot.mode, RobotMode::Telegram);
         assert!(config.robot.timeout_seconds.is_none());
     }
 
@@ -3432,11 +3568,28 @@ RObot:
 "#;
         let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.robot.enabled);
+        assert_eq!(config.robot.mode, RobotMode::Telegram);
         assert_eq!(config.robot.timeout_seconds, Some(300));
         let telegram = config.robot.telegram.as_ref().unwrap();
         assert_eq!(telegram.bot_token, Some("123456:ABC-DEF".to_string()));
 
         // Validation should pass
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_robot_config_web_mode_does_not_require_telegram() {
+        let yaml = r"
+RObot:
+  enabled: true
+  mode: web
+  timeout_seconds: 0
+";
+        let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.robot.enabled);
+        assert_eq!(config.robot.mode, RobotMode::Web);
+        assert_eq!(config.robot.timeout_seconds, Some(0));
+        assert!(config.robot.telegram.is_none());
         assert!(config.validate().is_ok());
     }
 
@@ -3477,6 +3630,7 @@ RObot:
         // Both timeout and token are missing, but timeout is checked first
         let robot = RobotConfig {
             enabled: true,
+            mode: RobotMode::Telegram,
             timeout_seconds: None,
             checkin_interval_seconds: None,
             telegram: None,
@@ -3499,6 +3653,7 @@ RObot:
         // forbid(unsafe_code) prevents env var manipulation in unit tests)
         let config = RobotConfig {
             enabled: true,
+            mode: RobotMode::Telegram,
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: Some(TelegramBotConfig {
@@ -3520,6 +3675,7 @@ RObot:
         // No config token and no telegram section
         let config = RobotConfig {
             enabled: true,
+            mode: RobotMode::Telegram,
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: None,
@@ -3538,6 +3694,7 @@ RObot:
         // Validation passes when bot_token is in config
         let robot = RobotConfig {
             enabled: true,
+            mode: RobotMode::Telegram,
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: Some(TelegramBotConfig {
@@ -3558,6 +3715,7 @@ RObot:
 
         let robot = RobotConfig {
             enabled: true,
+            mode: RobotMode::Telegram,
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: None,
@@ -3583,6 +3741,7 @@ RObot:
 
         let robot = RobotConfig {
             enabled: true,
+            mode: RobotMode::Telegram,
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: Some(TelegramBotConfig {

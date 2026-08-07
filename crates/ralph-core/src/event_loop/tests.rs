@@ -298,6 +298,225 @@ event_loop:
 }
 
 #[test]
+fn test_persisted_loop_state_round_trips_iteration_cost_and_last_hat() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let state_path = temp_dir.path().join(".ralph/api/loop-state.json");
+
+    let mut event_loop = EventLoop::new(RalphConfig::default());
+    event_loop.state.iteration = 7;
+    event_loop.state.cumulative_cost = 1.23;
+    event_loop.state.last_hat = Some(HatId::new("builder"));
+    event_loop
+        .state
+        .record_iteration_tokens(&HatId::new("builder"), 12_000);
+    event_loop
+        .state
+        .record_iteration_tokens(&HatId::new("reviewer"), 30_000);
+    event_loop
+        .state
+        .record_iteration_tokens(&HatId::new("builder"), 7_000);
+    event_loop.save_loop_state(&state_path).unwrap();
+
+    let mut resumed = EventLoop::new(RalphConfig::default());
+    resumed.restore_loop_state(&state_path).unwrap();
+
+    assert_eq!(resumed.state.iteration, 7);
+    assert!((resumed.state.cumulative_cost - 1.23).abs() < f64::EPSILON);
+    assert_eq!(resumed.state.last_hat.as_ref().unwrap().as_str(), "builder");
+    assert_eq!(resumed.state.peak_input_tokens, 30_000);
+    assert_eq!(resumed.state.last_input_tokens, Some(7_000));
+    assert_eq!(
+        resumed
+            .state
+            .hat_peak_input_tokens
+            .get(&HatId::new("builder"))
+            .copied(),
+        Some(12_000)
+    );
+    assert_eq!(
+        resumed
+            .state
+            .hat_peak_input_tokens
+            .get(&HatId::new("reviewer"))
+            .copied(),
+        Some(30_000)
+    );
+}
+
+#[test]
+fn test_fresh_run_clears_stale_persisted_loop_state() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let state_path = temp_dir.path().join(".ralph/api/loop-state.json");
+
+    let mut event_loop = EventLoop::new(RalphConfig::default());
+    event_loop.state.iteration = 3;
+    event_loop.state.cumulative_cost = 0.42;
+    event_loop.save_loop_state(&state_path).unwrap();
+    assert!(state_path.exists());
+
+    EventLoop::clear_loop_state(&state_path).unwrap();
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn test_resume_replay_hydrates_seen_topics_without_republishing_pre_terminate_events() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let yaml = r#"
+hats:
+  monitor:
+    name: "Monitor"
+    triggers: ["build.monitoring.resume"]
+    publishes: ["build.monitoring.done"]
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+
+    write_event_to_jsonl(&events_path, "task.start", "original objective");
+    write_event_to_jsonl(
+        &events_path,
+        "build.monitoring.park",
+        "park before shutdown",
+    );
+    write_event_to_jsonl(&events_path, "loop.terminate", "parked");
+
+    event_loop.replay_resume_events_from_jsonl().unwrap();
+
+    assert!(event_loop.state.seen_topics.contains("task.start"));
+    assert!(
+        event_loop
+            .state
+            .seen_topics
+            .contains("build.monitoring.park")
+    );
+    assert!(event_loop.state.seen_topics.contains("loop.terminate"));
+    assert!(
+        !event_loop.has_pending_events(),
+        "events before the last loop.terminate should hydrate state but not re-trigger hats"
+    );
+}
+
+#[test]
+fn test_resume_replay_publishes_events_after_last_terminate_to_bus() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let yaml = r#"
+hats:
+  monitor:
+    name: "Monitor"
+    triggers: ["build.monitoring.resume"]
+    publishes: ["build.monitoring.done"]
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+
+    write_event_to_jsonl(&events_path, "task.start", "original objective");
+    write_event_to_jsonl(&events_path, "loop.terminate", "parked");
+    write_event_to_jsonl(
+        &events_path,
+        "build.monitoring.resume",
+        "watchdog says continue",
+    );
+
+    event_loop.replay_resume_events_from_jsonl().unwrap();
+
+    assert!(event_loop.state.seen_topics.contains("task.start"));
+    assert!(event_loop.state.seen_topics.contains("loop.terminate"));
+    assert!(
+        event_loop
+            .state
+            .seen_topics
+            .contains("build.monitoring.resume")
+    );
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(
+        prompt.contains("build.monitoring.resume"),
+        "post-terminate resume event should be delivered to the in-memory bus"
+    );
+    assert!(prompt.contains("watchdog says continue"));
+}
+
+#[test]
+fn test_resume_replay_ignores_malformed_events_before_last_terminate() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let yaml = r#"
+hats:
+  monitor:
+    name: "Monitor"
+    triggers: ["build.monitoring.resume"]
+    publishes: ["build.monitoring.done"]
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+
+    write_raw_line_to_jsonl(&events_path, "{not json");
+    write_raw_line_to_jsonl(&events_path, "{\"topic\":");
+    write_raw_line_to_jsonl(&events_path, "still not json");
+    write_event_to_jsonl(&events_path, "task.start", "original objective");
+    write_event_to_jsonl(&events_path, "loop.terminate", "parked");
+    write_event_to_jsonl(
+        &events_path,
+        "build.monitoring.resume",
+        "watchdog says continue",
+    );
+
+    event_loop.replay_resume_events_from_jsonl().unwrap();
+
+    assert_eq!(
+        event_loop.state.consecutive_malformed_events, 0,
+        "malformed history before the last loop.terminate must not trip resume validation"
+    );
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(prompt.contains("build.monitoring.resume"));
+    assert!(!prompt.contains("event.malformed"));
+}
+
+#[test]
+fn test_resume_replay_reports_malformed_events_after_last_terminate() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+
+    write_event_to_jsonl(&events_path, "task.start", "original objective");
+    write_event_to_jsonl(&events_path, "loop.terminate", "parked");
+    write_raw_line_to_jsonl(&events_path, "{not json");
+
+    event_loop.replay_resume_events_from_jsonl().unwrap();
+
+    assert_eq!(
+        event_loop.state.consecutive_malformed_events, 1,
+        "malformed lines after the last loop.terminate should still use normal backpressure"
+    );
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(prompt.contains("event.malformed"));
+}
+
+#[test]
 fn test_completion_promise_detection() {
     use std::fs;
     use tempfile::TempDir;
@@ -596,6 +815,16 @@ fn write_event_to_jsonl(path: &std::path::Path, topic: &str, payload: &str) {
     writeln!(file, "{}", event_json).unwrap();
 }
 
+fn write_raw_line_to_jsonl(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
 #[test]
 fn test_loop_thrashing_detection() {
     use tempfile::tempdir;
@@ -872,6 +1101,79 @@ hats:
 }
 
 #[test]
+fn test_custom_hat_generated_instructions_respect_disabled_scratchpad() {
+    let yaml = r#"
+hats:
+  planner:
+    name: "Planner"
+    triggers: ["task.start", "review.changes_requested"]
+    publishes: ["build.task"]
+    scratchpad:
+      enabled: false
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Plan this task");
+
+    let prompt = event_loop.build_prompt(&HatId::new("planner")).unwrap();
+
+    assert!(prompt.contains("Analyze the task and create a plan."));
+    assert!(prompt.contains("Add fix tasks with `ralph tools task` and dispatch."));
+    assert!(
+        !prompt.to_ascii_lowercase().contains("scratchpad"),
+        "Disabled per-hat scratchpad config should suppress generated scratchpad instructions"
+    );
+}
+
+#[test]
+fn test_custom_hat_generated_instructions_name_custom_scratchpad_path() {
+    let yaml = r#"
+hats:
+  planner:
+    name: "Planner"
+    triggers: ["task.start", "review.changes_requested"]
+    publishes: ["build.task"]
+    scratchpad: ".ralph/agent/planner.md"
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Plan this task");
+
+    let prompt = event_loop.build_prompt(&HatId::new("planner")).unwrap();
+
+    assert!(prompt.contains(
+        "Analyze the task and create a plan in the scratchpad at `.ralph/agent/planner.md`."
+    ));
+    assert!(
+        prompt
+            .contains("Add fix tasks to the scratchpad at `.ralph/agent/planner.md` and dispatch.")
+    );
+}
+
+#[test]
+fn test_custom_hat_generated_instructions_inherit_default_scratchpad_behavior() {
+    let yaml = r#"
+hats:
+  planner:
+    name: "Planner"
+    triggers: ["task.start", "review.changes_requested"]
+    publishes: ["build.task"]
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Plan this task");
+
+    let prompt = event_loop.build_prompt(&HatId::new("planner")).unwrap();
+
+    assert!(prompt.contains("Analyze the task and create a plan in the scratchpad."));
+    assert!(prompt.contains("Add fix tasks to scratchpad and dispatch."));
+    assert!(
+        !prompt.contains(".ralph/agent/scratchpad.md"),
+        "Inherited default behavior should keep the old wording without injecting the default path"
+    );
+}
+
+#[test]
 fn test_custom_hat_without_instructions_gets_default_behavior() {
     // Test that custom hats without instructions still work with build_custom_hat
     let yaml = r#"
@@ -1079,6 +1381,145 @@ fn test_default_publishes_injects_when_no_events() {
     assert!(
         event_loop.state.seen_topics.contains("task.done"),
         "default_publishes should record topic in seen_topics for chain validation"
+    );
+}
+
+#[test]
+fn test_default_publishes_completion_promise_requires_explicit_agent_event() {
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let mut config = RalphConfig::default();
+    let mut hats = HashMap::new();
+    hats.insert(
+        "final-reviewer".to_string(),
+        crate::config::HatConfig {
+            name: "final-reviewer".to_string(),
+            description: Some("Final reviewer".to_string()),
+            triggers: vec!["review.ready".to_string()],
+            publishes: vec!["LOOP_COMPLETE".to_string()],
+            instructions: "Verify the objective is complete".to_string(),
+            extra_instructions: vec![],
+            backend_args: None,
+            backend: None,
+            default_publishes: Some("LOOP_COMPLETE".to_string()),
+            max_activations: None,
+            scratchpad: None,
+            disallowed_tools: vec![],
+            timeout: None,
+            concurrency: 1,
+            aggregate: None,
+        },
+    );
+    config.hats = hats;
+
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.initialize("Test");
+
+    let hat_id = HatId::new("final-reviewer");
+    let result = event_loop.process_events_from_jsonl().unwrap();
+    assert!(!result.had_events, "No agent events should be found");
+
+    event_loop.check_default_publishes(&hat_id);
+
+    assert!(
+        !event_loop.state.completion_requested,
+        "agent silence must not request LOOP_COMPLETE via default_publishes"
+    );
+    assert_eq!(
+        event_loop.check_completion_event(),
+        None,
+        "default_publishes must not terminate the loop on agent silence"
+    );
+    assert!(
+        event_loop.state.seen_topics.contains("task.resume"),
+        "a recovery event should be recorded instead"
+    );
+    assert!(
+        !event_loop.state.seen_topics.contains("LOOP_COMPLETE"),
+        "completion promise should not be marked seen without an explicit agent event"
+    );
+}
+
+#[test]
+fn test_unacknowledged_human_guidance_blocks_completion() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let mut event_loop = EventLoop::new(RalphConfig::default());
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.initialize("Test");
+
+    write_event_to_jsonl(
+        &events_path,
+        "human.guidance",
+        "Please do not use odd Node.js versions",
+    );
+    write_event_to_jsonl(&events_path, "LOOP_COMPLETE", "done");
+    let result = event_loop.process_events_from_jsonl().unwrap();
+
+    assert!(
+        result.had_events,
+        "guidance and completion events should parse"
+    );
+    assert_eq!(
+        event_loop.check_completion_event(),
+        None,
+        "completion must be rejected until human.guidance is acknowledged"
+    );
+    assert!(
+        event_loop.has_pending_events(),
+        "completion rejection should inject task.resume for recovery"
+    );
+    assert_eq!(
+        event_loop.state.unacknowledged_guidance.len(),
+        1,
+        "guidance remains blocking until human.guidance.ack"
+    );
+}
+
+#[test]
+fn test_human_guidance_ack_allows_completion() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let mut event_loop = EventLoop::new(RalphConfig::default());
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.initialize("Test");
+
+    write_event_to_jsonl(
+        &events_path,
+        "human.guidance",
+        "Please do not use odd Node.js versions",
+    );
+    write_event_to_jsonl(
+        &events_path,
+        "human.guidance.ack",
+        "Used Node.js 22 LTS instead",
+    );
+    write_event_to_jsonl(&events_path, "LOOP_COMPLETE", "done");
+    let result = event_loop.process_events_from_jsonl().unwrap();
+
+    assert!(
+        result.had_events,
+        "guidance, ack, and completion events should parse"
+    );
+    assert!(
+        event_loop.state.unacknowledged_guidance.is_empty(),
+        "human.guidance.ack should clear guidance backpressure"
+    );
+    assert_eq!(
+        event_loop.check_completion_event(),
+        Some(TerminationReason::CompletionPromise),
+        "acknowledged guidance should allow normal completion"
     );
 }
 
@@ -3846,6 +4287,45 @@ hats:
 }
 
 #[test]
+fn test_iteration_summary_bypasses_scope_enforcement() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let yaml = r#"
+event_loop:
+  enforce_hat_scope: true
+hats:
+  builder:
+    name: "Builder"
+    triggers: ["build.start"]
+    publishes: ["build.done"]
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.state.last_active_hat_ids = vec![HatId::new("builder")];
+
+    write_event_to_jsonl(
+        &events_path,
+        "iteration.summary",
+        r#"{"context_window":200000,"context_tokens":88000}"#,
+    );
+
+    let processed = event_loop.process_events_from_jsonl().unwrap();
+
+    assert!(
+        !processed.had_events,
+        "iteration.summary is observer telemetry and should not route on the bus"
+    );
+    assert!(
+        !event_loop.has_pending_events(),
+        "iteration.summary must not produce a scope_violation event"
+    );
+}
+
+#[test]
 fn test_scope_violation_event_published() {
     use tempfile::TempDir;
 
@@ -4110,7 +4590,7 @@ fn test_default_publishes_satisfies_required_events_for_completion() {
 }
 
 #[test]
-fn test_default_publishes_completion_promise_triggers_termination() {
+fn test_default_publishes_completion_promise_injects_recovery() {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -4159,14 +4639,24 @@ fn test_default_publishes_completion_promise_triggers_termination() {
     let hat_id = HatId::new("final_committer");
     event_loop.check_default_publishes(&hat_id);
 
-    // completion_requested should be set directly by check_default_publishes
-    // (not requiring a JSONL round-trip)
+    // Completion defaults are recovery-only: a silent final hat must not
+    // terminate the loop without an explicit agent-written completion event.
     let reason = event_loop.check_completion_event();
     assert_eq!(
-        reason,
-        Some(TerminationReason::CompletionPromise),
-        "default_publishes of completion_promise should trigger termination directly, \
-         not just publish to the bus where it would be lost"
+        reason, None,
+        "default_publishes of completion_promise must not silently terminate"
+    );
+    assert!(
+        !event_loop.state.completion_requested,
+        "completion should not be requested from agent silence"
+    );
+    assert!(
+        event_loop.state.seen_topics.contains("task.resume"),
+        "a recovery task.resume should be injected for the silent final hat"
+    );
+    assert!(
+        !event_loop.state.seen_topics.contains("LOOP_COMPLETE"),
+        "LOOP_COMPLETE should only be seen after an explicit event"
     );
 }
 
@@ -4308,6 +4798,79 @@ impl ralph_proto::RobotService for RestartRequestRobotService {
     fn stop(self: Box<Self>) {}
 }
 
+struct DurableResponseRobotService {
+    write_guidance_after_response: bool,
+}
+
+impl ralph_proto::RobotService for DurableResponseRobotService {
+    fn send_question(&self, _payload: &str) -> anyhow::Result<i32> {
+        Ok(1)
+    }
+
+    fn wait_for_response(&self, events_path: &Path) -> anyhow::Result<Option<String>> {
+        write_event_to_jsonl(events_path, "human.response", "approved");
+        if self.write_guidance_after_response {
+            write_event_to_jsonl(events_path, "human.guidance", "keep going");
+        }
+        Ok(Some("approved".to_string()))
+    }
+
+    fn response_events_are_durable(&self) -> bool {
+        true
+    }
+
+    fn send_checkin(
+        &self,
+        _: u32,
+        _: Duration,
+        _: Option<&ralph_proto::CheckinContext>,
+    ) -> anyhow::Result<i32> {
+        Ok(0)
+    }
+
+    fn timeout_secs(&self) -> u64 {
+        5
+    }
+
+    fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn stop(self: Box<Self>) {}
+}
+
+struct NonDurableResponseWithGuidanceRobotService;
+
+impl ralph_proto::RobotService for NonDurableResponseWithGuidanceRobotService {
+    fn send_question(&self, _payload: &str) -> anyhow::Result<i32> {
+        Ok(1)
+    }
+
+    fn wait_for_response(&self, events_path: &Path) -> anyhow::Result<Option<String>> {
+        write_event_to_jsonl(events_path, "human.guidance", "keep going");
+        Ok(Some("approved".to_string()))
+    }
+
+    fn send_checkin(
+        &self,
+        _: u32,
+        _: Duration,
+        _: Option<&ralph_proto::CheckinContext>,
+    ) -> anyhow::Result<i32> {
+        Ok(0)
+    }
+
+    fn timeout_secs(&self) -> u64 {
+        5
+    }
+
+    fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn stop(self: Box<Self>) {}
+}
+
 #[test]
 fn test_human_timeout_injects_timeout_event() {
     use tempfile::TempDir;
@@ -4332,6 +4895,193 @@ fn test_human_timeout_injects_timeout_event() {
     assert!(
         event_loop.has_pending_events(),
         "human.timeout event should be published on timeout"
+    );
+}
+
+#[test]
+fn test_robot_response_is_persisted_without_replay() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.set_robot_service(Box::new(MockRobotService {
+        timeout: 5,
+        should_timeout: false,
+    }));
+
+    write_event_to_jsonl(&events_path, "human.interact", "Please review this plan");
+    let _ = event_loop.process_events_from_jsonl();
+
+    let first_events = event_loop.bus().take_human_pending();
+    let response_events: Vec<_> = first_events
+        .iter()
+        .filter(|event| event.topic.as_str() == "human.response")
+        .collect();
+    assert_eq!(response_events.len(), 1);
+    assert_eq!(response_events[0].payload, "approved");
+
+    let persisted = std::fs::read_to_string(&events_path).expect("read events");
+    let persisted_responses = persisted
+        .lines()
+        .filter_map(|line| serde_json::from_str::<crate::event_reader::Event>(line).ok())
+        .filter(|event| event.topic.as_str() == "human.response")
+        .count();
+    assert_eq!(persisted_responses, 1);
+
+    let _ = event_loop.process_events_from_jsonl();
+    let replayed_events = event_loop.bus().take_human_pending();
+    assert!(
+        replayed_events.is_empty(),
+        "persisted robot response should not be replayed: {:?}",
+        replayed_events
+    );
+}
+
+#[test]
+fn test_non_durable_robot_response_skip_preserves_intervening_guidance() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.set_robot_service(Box::new(NonDurableResponseWithGuidanceRobotService));
+
+    write_event_to_jsonl(&events_path, "human.interact", "Please review this plan");
+    let _ = event_loop.process_events_from_jsonl();
+
+    let first_events = event_loop.bus().take_human_pending();
+    assert!(
+        first_events
+            .iter()
+            .any(|event| event.topic.as_str() == "human.guidance" && event.payload == "keep going"),
+        "guidance appended during robot wait should be published: {:?}",
+        first_events
+    );
+    assert_eq!(
+        first_events
+            .iter()
+            .filter(|event| event.topic.as_str() == "human.response")
+            .count(),
+        1,
+        "robot response should be published exactly once initially: {:?}",
+        first_events
+    );
+    assert_eq!(
+        event_loop.state.unacknowledged_guidance,
+        vec!["keep going".to_string()],
+        "guidance arriving during robot wait must enter guidance backpressure"
+    );
+
+    let _ = event_loop.process_events_from_jsonl();
+    let replayed_events = event_loop.bus().take_human_pending();
+    assert!(
+        !replayed_events
+            .iter()
+            .any(|event| event.topic.as_str() == "human.response"),
+        "orchestrator-appended response should not be replayed: {:?}",
+        replayed_events
+    );
+    assert!(
+        replayed_events.is_empty(),
+        "intervening guidance should have been consumed exactly once: {:?}",
+        replayed_events
+    );
+
+    write_event_to_jsonl(&events_path, "LOOP_COMPLETE", "done");
+    let _ = event_loop.process_events_from_jsonl();
+    assert_eq!(
+        event_loop.check_completion_event(),
+        None,
+        "completion must stay blocked until guidance from robot wait is acknowledged"
+    );
+}
+
+#[test]
+fn test_durable_robot_response_is_not_duplicated_or_replayed() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.set_robot_service(Box::new(DurableResponseRobotService {
+        write_guidance_after_response: false,
+    }));
+
+    write_event_to_jsonl(&events_path, "human.interact", "Please review this plan");
+    let _ = event_loop.process_events_from_jsonl();
+
+    let first_events = event_loop.bus().take_human_pending();
+    let response_events: Vec<_> = first_events
+        .iter()
+        .filter(|event| event.topic.as_str() == "human.response")
+        .collect();
+    assert_eq!(response_events.len(), 1);
+    assert_eq!(response_events[0].payload, "approved");
+
+    let persisted = std::fs::read_to_string(&events_path).expect("read events");
+    let persisted_responses = persisted
+        .lines()
+        .filter_map(|line| serde_json::from_str::<crate::event_reader::Event>(line).ok())
+        .filter(|event| event.topic.as_str() == "human.response")
+        .count();
+    assert_eq!(persisted_responses, 1);
+
+    let _ = event_loop.process_events_from_jsonl();
+    let replayed_events = event_loop.bus().take_human_pending();
+    assert!(
+        replayed_events.is_empty(),
+        "durably written robot response should not be replayed: {:?}",
+        replayed_events
+    );
+}
+
+#[test]
+fn test_durable_robot_response_skip_preserves_later_guidance() {
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.set_robot_service(Box::new(DurableResponseRobotService {
+        write_guidance_after_response: true,
+    }));
+
+    write_event_to_jsonl(&events_path, "human.interact", "Please review this plan");
+    let _ = event_loop.process_events_from_jsonl();
+    let _ = event_loop.bus().take_human_pending();
+
+    let _ = event_loop.process_events_from_jsonl();
+    let later_events = event_loop.bus().take_human_pending();
+    assert!(
+        later_events
+            .iter()
+            .any(|event| event.topic.as_str() == "human.guidance" && event.payload == "keep going"),
+        "guidance appended after durable response should remain unread: {:?}",
+        later_events
+    );
+    assert!(
+        !later_events
+            .iter()
+            .any(|event| event.topic.as_str() == "human.response"),
+        "durable response should not be replayed: {:?}",
+        later_events
     );
 }
 

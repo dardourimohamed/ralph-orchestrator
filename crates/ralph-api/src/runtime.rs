@@ -25,6 +25,7 @@ use crate::protocol::{
     is_mutating_method, parse_json_value, parse_request, request_context, success_envelope,
     validate_request_schema,
 };
+use crate::robot_domain::RobotDomain;
 use crate::stream_domain::StreamDomain;
 use crate::task_domain::TaskDomain;
 
@@ -46,6 +47,7 @@ pub struct RpcRuntime {
     streams: StreamDomain,
     config_domain: ConfigDomain,
     preset_domain: PresetDomain,
+    robot_domain: RobotDomain,
 }
 
 enum ExecutionOutcome {
@@ -81,6 +83,7 @@ impl RpcRuntime {
         let streams = StreamDomain::new();
         let config_domain = ConfigDomain::new(&config.workspace_root);
         let preset_domain = PresetDomain::new(&config.workspace_root);
+        let robot_domain = RobotDomain::new(&config.workspace_root);
 
         Self {
             config,
@@ -93,6 +96,7 @@ impl RpcRuntime {
             streams,
             config_domain,
             preset_domain,
+            robot_domain,
         }
     }
 
@@ -240,6 +244,10 @@ impl RpcRuntime {
         &self.preset_domain
     }
 
+    pub(crate) fn robot_domain(&self) -> &RobotDomain {
+        &self.robot_domain
+    }
+
     pub(crate) fn parse_params<T>(&self, request: &RpcRequestEnvelope) -> Result<T, ApiError>
     where
         T: DeserializeOwned,
@@ -254,6 +262,12 @@ impl RpcRuntime {
 
     fn parse_and_validate_request(&self, body: &[u8]) -> Result<RpcRequestEnvelope, ApiError> {
         let raw = parse_json_value(body)?;
+        let (request_id, method) = request_context(&raw);
+        if method.as_deref() == Some("_internal.publish") {
+            return Err(ApiError::method_not_found("_internal.publish")
+                .with_context(request_id, Some("_internal.publish".to_string())));
+        }
+
         self.parse_and_validate_request_value(raw)
     }
 
@@ -271,6 +285,10 @@ impl RpcRuntime {
             ApiError::invalid_request("missing required field 'method'")
                 .with_context(request_id.clone(), None)
         })?;
+
+        if method == "_internal.publish" {
+            return self.parse_and_validate_internal_publish_request(raw, request_id, method);
+        }
 
         if !is_known_method(&method) {
             return Err(
@@ -296,6 +314,30 @@ impl RpcRuntime {
             ))
             .with_context(request.id, Some(request.method)));
         }
+
+        Ok(request)
+    }
+
+    fn parse_and_validate_internal_publish_request(
+        &self,
+        raw: Value,
+        request_id: String,
+        method: String,
+    ) -> Result<RpcRequestEnvelope, ApiError> {
+        let request = parse_request(&raw)
+            .map_err(|error| error.with_context(request_id.clone(), Some(method.clone())))?;
+
+        if request.api_version != API_VERSION {
+            return Err(ApiError::invalid_request(format!(
+                "unsupported apiVersion '{}'; expected '{API_VERSION}'",
+                request.api_version
+            ))
+            .with_context(request.id, Some(request.method)));
+        }
+
+        validate_internal_publish_params(&request.params).map_err(|error| {
+            error.with_context(request.id.clone(), Some(request.method.clone()))
+        })?;
 
         Ok(request)
     }
@@ -414,4 +456,49 @@ impl RpcRuntime {
         error.status = StatusCode::from_u16(response.status).unwrap_or(error.status);
         Err(error)
     }
+}
+
+fn validate_internal_publish_params(params: &Value) -> Result<(), ApiError> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| ApiError::invalid_params("_internal.publish params must be an object"))?;
+
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "topic" | "resourceType" | "resourceId" | "payload"
+        ) {
+            return Err(ApiError::invalid_params(format!(
+                "_internal.publish does not accept '{key}'"
+            )));
+        }
+    }
+
+    let topic = required_non_empty_string(object.get("topic"), "topic")?;
+    if !STREAM_TOPICS.contains(&topic) {
+        return Err(ApiError::invalid_params(format!(
+            "_internal.publish topic '{topic}' is not registered"
+        )));
+    }
+
+    required_non_empty_string(object.get("resourceType"), "resourceType")?;
+    required_non_empty_string(object.get("resourceId"), "resourceId")?;
+
+    if !matches!(object.get("payload"), Some(Value::Object(_))) {
+        return Err(ApiError::invalid_params(
+            "_internal.publish requires object 'payload'",
+        ));
+    }
+
+    Ok(())
+}
+
+fn required_non_empty_string<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+) -> Result<&'a str, ApiError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::invalid_params(format!("_internal.publish requires '{field}'")))
 }

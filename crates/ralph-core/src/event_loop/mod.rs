@@ -19,8 +19,11 @@ use crate::memory_store::{MarkdownMemoryStore, format_memories_as_markdown, trun
 use crate::skill_registry::SkillRegistry;
 use crate::text::floor_char_boundary;
 use ralph_proto::{CheckinContext, Event, EventBus, Hat, HatId, RobotService};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -47,6 +50,20 @@ pub struct ProcessedEventsWithWaves {
     pub processed: ProcessedEvents,
     /// Wave events extracted before normal processing (have wave_id set).
     pub wave_events: Vec<crate::event_reader::Event>,
+}
+
+/// Durable subset of loop runtime state restored by `ralph run --continue`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedLoopState {
+    pub iteration: u32,
+    pub total_cost_usd: f64,
+    pub last_hat: Option<String>,
+    #[serde(default)]
+    pub peak_input_tokens: u64,
+    #[serde(default)]
+    pub last_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub hat_peak_input_tokens: HashMap<String, u64>,
 }
 
 /// Reason the event loop terminated.
@@ -465,6 +482,84 @@ impl EventLoop {
         &self.state
     }
 
+    /// Record this iteration's context-token usage for `hat`.
+    ///
+    /// Passthrough to `LoopState::record_iteration_tokens` — preserves the
+    /// `record_event` encapsulation precedent (callers don't need `&mut LoopState`).
+    pub fn record_iteration_tokens(&mut self, hat: &HatId, tokens: u64) {
+        self.state.record_iteration_tokens(hat, tokens);
+    }
+
+    /// Returns the path used for durable `--continue` loop state.
+    pub fn loop_state_path(&self) -> PathBuf {
+        self.loop_context
+            .as_ref()
+            .map(|ctx| ctx.ralph_dir().join("api/loop-state.json"))
+            .unwrap_or_else(|| PathBuf::from(".ralph/api/loop-state.json"))
+    }
+
+    /// Serializes the durable subset of runtime state.
+    pub fn persisted_loop_state(&self) -> PersistedLoopState {
+        PersistedLoopState {
+            iteration: self.state.iteration,
+            total_cost_usd: self.state.cumulative_cost,
+            last_hat: self
+                .state
+                .last_hat
+                .as_ref()
+                .map(|hat| hat.as_str().to_string()),
+            peak_input_tokens: self.state.peak_input_tokens,
+            last_input_tokens: self.state.last_input_tokens,
+            hat_peak_input_tokens: self
+                .state
+                .hat_peak_input_tokens
+                .iter()
+                .map(|(hat, tokens)| (hat.as_str().to_string(), *tokens))
+                .collect(),
+        }
+    }
+
+    /// Restores persisted `--continue` state from disk if present.
+    pub fn restore_loop_state(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let raw = std::fs::read_to_string(path)?;
+        let persisted: PersistedLoopState = serde_json::from_str(&raw).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        self.state.iteration = persisted.iteration;
+        self.state.cumulative_cost = persisted.total_cost_usd;
+        self.state.last_hat = persisted.last_hat.map(HatId::new);
+        self.state.peak_input_tokens = persisted.peak_input_tokens;
+        self.state.last_input_tokens = persisted.last_input_tokens;
+        self.state.hat_peak_input_tokens = persisted
+            .hat_peak_input_tokens
+            .into_iter()
+            .map(|(hat, tokens)| (HatId::new(hat), tokens))
+            .collect();
+        Ok(())
+    }
+
+    /// Saves persisted `--continue` state to disk.
+    pub fn save_loop_state(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let payload = serde_json::to_string_pretty(&self.persisted_loop_state())?;
+        std::fs::write(path, payload)
+    }
+
+    /// Removes stale persisted loop state for a fresh run.
+    pub fn clear_loop_state(path: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resets the stale-loop topic counter.
     ///
     /// Call after processing wave results — multiple events with the same topic
@@ -664,6 +759,22 @@ impl EventLoop {
             }
         }
 
+        if !self.state.unacknowledged_guidance.is_empty() {
+            let guidance_count = self.state.unacknowledged_guidance.len();
+            warn!(
+                guidance_count,
+                "Rejecting LOOP_COMPLETE: human.guidance is unacknowledged"
+            );
+            self.state.completion_requested = false;
+            self.bus.publish(Event::new(
+                "task.resume",
+                format!(
+                    "Completion rejected: {guidance_count} human.guidance message(s) remain unacknowledged. Address the guidance, then emit human.guidance.ack with a summary before emitting the completion promise."
+                ),
+            ));
+            return None;
+        }
+
         self.state.completion_requested = false;
 
         // In persistent mode, suppress completion and keep the loop alive
@@ -787,6 +898,83 @@ impl EventLoop {
             // Find ralph in the bus's registered hats
             self.bus.hat_ids().find(|id| id.as_str() == "ralph")
         }
+    }
+
+    /// Replays persisted events needed to resume an interrupted/parked loop.
+    ///
+    /// Resume has two separate needs:
+    /// - all historical topics hydrate `seen_topics` so event-chain validation
+    ///   knows what happened before the process restarted;
+    /// - events appended after the last `loop.terminate` are republished to the
+    ///   in-memory bus so watchdog/human resume events trigger hats naturally.
+    ///
+    /// Events at or before the last `loop.terminate` are state history only and
+    /// must not be republished, otherwise `--continue` would rerun old work.
+    pub fn replay_resume_events_from_jsonl(&mut self) -> std::io::Result<ProcessedEvents> {
+        let path = self.event_reader.path().to_path_buf();
+        let mut historical_reader = EventReader::new(&path);
+        let result = historical_reader.read_new_events()?;
+
+        for event in &result.events {
+            self.state.seen_topics.insert(event.topic.clone());
+        }
+
+        let last_terminate_index = result
+            .events
+            .iter()
+            .rposition(|event| event.topic == "loop.terminate");
+        let last_terminate_line = if result.malformed.is_empty() {
+            None
+        } else {
+            Self::last_terminate_line_number(&path)?
+        };
+        let replay_events = match last_terminate_index {
+            Some(index) => result.events.into_iter().skip(index + 1).collect(),
+            None => Vec::new(),
+        };
+        let replay_malformed = match last_terminate_line {
+            Some(line_number) => result
+                .malformed
+                .into_iter()
+                .filter(|malformed| malformed.line_number > line_number)
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let processed = self.process_parse_result(crate::event_reader::ParseResult {
+            events: replay_events,
+            malformed: replay_malformed,
+        })?;
+
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            self.event_reader.set_position(metadata.len());
+        }
+
+        Ok(processed)
+    }
+
+    fn last_terminate_line_number(path: &Path) -> std::io::Result<Option<u64>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut last_terminate = None;
+
+        for (index, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<crate::event_reader::Event>(&line)
+                && event.topic == "loop.terminate"
+            {
+                last_terminate = Some(index as u64 + 1);
+            }
+        }
+
+        Ok(last_terminate)
     }
 
     /// Advances the event reader to the current end of the events file.
@@ -1097,9 +1285,17 @@ impl EventLoop {
             "build_prompt: routing to build_custom_hat() for '{}'",
             hat_id.as_str()
         );
+        let hat_scratchpad = self
+            .registry
+            .get_config(hat_id)
+            .and_then(|c| c.scratchpad.as_ref());
+        let resolved_scratchpad =
+            ScratchpadConfig::resolve(hat_scratchpad, &self.config.core.scratchpad);
+        self.ralph
+            .set_active_scratchpad(resolved_scratchpad.clone());
         Some(
             self.instruction_builder
-                .build_custom_hat(hat, &events_context),
+                .build_custom_hat(hat, &events_context, &resolved_scratchpad),
         )
     }
 
@@ -1765,6 +1961,26 @@ impl EventLoop {
         if let Some(config) = self.registry.get_config(hat_id)
             && let Some(default_topic) = &config.default_publishes
         {
+            if default_topic.as_str() == self.config.event_loop.completion_promise {
+                warn!(
+                    hat = %hat_id.as_str(),
+                    topic = %default_topic,
+                    "default_publishes matches completion_promise — requiring explicit agent event"
+                );
+                let resume_event = Event::new(
+                    "task.resume",
+                    format!(
+                        "Recovery: hat `{}` produced no events, and its default_publishes is the completion promise `{}`. Ralph will not complete silently; emit explicit completion evidence or a valid non-terminal event.",
+                        hat_id.as_str(),
+                        default_topic
+                    ),
+                )
+                .with_target(hat_id.clone());
+                self.state.record_event(&resume_event);
+                self.bus.publish(resume_event);
+                return;
+            }
+
             let default_event = Event::new(default_topic.as_str(), "").with_source(hat_id.clone());
 
             debug!(
@@ -1774,19 +1990,6 @@ impl EventLoop {
             );
 
             self.state.record_event(&default_event);
-
-            // If the default topic is the completion promise, set the flag directly.
-            // The normal path (process_events_from_jsonl) sets this when reading from
-            // JSONL, but default_publishes bypasses JSONL entirely.
-            if default_topic.as_str() == self.config.event_loop.completion_promise {
-                info!(
-                    hat = %hat_id.as_str(),
-                    topic = %default_topic,
-                    "default_publishes matches completion_promise — requesting termination"
-                );
-                self.state.completion_requested = true;
-            }
-
             self.bus.publish(default_event);
         }
     }
@@ -2227,7 +2430,7 @@ impl EventLoop {
         for malformed in &result.malformed {
             let payload = format!(
                 "Line {}: {}\nContent: {}",
-                malformed.line_number, malformed.error, &malformed.content
+                malformed.line_number, malformed.error, malformed.content
             );
             let event = Event::new("event.malformed", &payload);
             self.bus.publish(event);
@@ -2253,12 +2456,21 @@ impl EventLoop {
             });
         }
 
+        // Drop orchestrator-synthetic observer rows (spec §10) before scope
+        // enforcement so Ralph's own summary telemetry cannot be mistaken for
+        // an out-of-scope agent-authored event.
+        let events: Vec<_> = result
+            .events
+            .into_iter()
+            .filter(|event| event.topic.as_str() != "iteration.summary")
+            .collect();
+
         // --- Scope enforcement: filter events against active hat's publishes ---
         // Only active when enforce_hat_scope is true in config (opt-in).
         let events = if self.config.event_loop.enforce_hat_scope {
             let active_hats = self.state.last_active_hat_ids.clone();
             let (in_scope, out_of_scope): (Vec<_>, Vec<_>) =
-                result.events.into_iter().partition(|event| {
+                events.into_iter().partition(|event| {
                     if active_hats.is_empty() {
                         return true; // Ralph coordinating — no scope restriction
                     }
@@ -2286,7 +2498,7 @@ impl EventLoop {
 
             in_scope
         } else {
-            result.events
+            events
         };
         // --- End scope enforcement ---
 
@@ -2294,7 +2506,7 @@ impl EventLoop {
 
         // Validate and transform events (apply backpressure for build.done)
         let mut validated_events = Vec::new();
-        let completion_topic = self.config.event_loop.completion_promise.as_str();
+        let completion_topic = self.config.event_loop.completion_promise.clone();
         let cancellation_topic = self.config.event_loop.cancellation_promise.clone();
         let total_events = events.len();
         for (index, event) in events.into_iter().enumerate() {
@@ -2311,7 +2523,24 @@ impl EventLoop {
                 continue;
             }
 
-            if event.topic == completion_topic {
+            if event.topic.as_str() == "human.guidance" {
+                self.state.unacknowledged_guidance.push(payload.clone());
+                validated_events.push(Event::new(event.topic.as_str(), &payload));
+                continue;
+            }
+
+            if event.topic.as_str() == "human.guidance.ack" {
+                info!(
+                    payload = %payload,
+                    guidance_count = self.state.unacknowledged_guidance.len(),
+                    "human.guidance acknowledged"
+                );
+                self.state.unacknowledged_guidance.clear();
+                validated_events.push(Event::new(event.topic.as_str(), &payload));
+                continue;
+            }
+
+            if event.topic.as_str() == completion_topic {
                 if index + 1 == total_events {
                     self.state.completion_requested = true;
                     self.diagnostics.log_orchestration(
@@ -2588,6 +2817,7 @@ impl EventLoop {
         // send the question and block until human.response or timeout.
         let mut response_event = None;
         let mut human_interact_context = None;
+        let mut events_arrived_during_robot_wait = Vec::new();
         let ask_human_idx = validated_events
             .iter()
             .position(|e| e.topic == "human.interact".into());
@@ -2600,15 +2830,27 @@ impl EventLoop {
                 Value::Object(map) => map,
                 _ => Map::new(),
             };
+            context
+                .entry("iteration".to_string())
+                .or_insert_with(|| Value::from(self.state.iteration));
+            context.entry("hat".to_string()).or_insert_with(|| {
+                ask_event
+                    .source
+                    .as_ref()
+                    .or(ask_event.target.as_ref())
+                    .map(|hat| Value::String(hat.as_str().to_string()))
+                    .unwrap_or_else(|| Value::String(self.get_active_hat_id().as_str().to_string()))
+            });
 
             if let Some(ref robot_service) = self.robot_service {
+                let robot_payload = Value::Object(context.clone()).to_string();
                 info!(
                     payload = %payload,
                     "human.interact event detected — sending question via robot service"
                 );
 
                 // Send the question (includes retry with exponential backoff)
-                let send_ok = match robot_service.send_question(&payload) {
+                let send_ok = match robot_service.send_question(&robot_payload) {
                     Ok(_message_id) => true,
                     Err(e) => {
                         warn!(
@@ -2656,7 +2898,7 @@ impl EventLoop {
                             self.loop_context
                                 .as_ref()
                                 .map(|ctx| ctx.events_path())
-                                .unwrap_or_else(|| PathBuf::from(".ralph/events.jsonl"))
+                                .unwrap_or_else(|| self.event_reader.path().to_path_buf())
                         });
 
                     match robot_service.wait_for_response(&events_path) {
@@ -2670,8 +2912,29 @@ impl EventLoop {
                                 Value::String("response".to_string()),
                             );
                             context.insert("response".to_string(), Value::String(response.clone()));
-                            // Create a human.response event to inject into the bus
-                            response_event = Some(Event::new("human.response", &response));
+                            let event = Event::new("human.response", &response);
+                            if robot_service.response_events_are_durable() {
+                                events_arrived_during_robot_wait.extend(
+                                    self.skip_consumed_robot_response_event(
+                                        &events_path,
+                                        &response,
+                                    ),
+                                );
+                            } else {
+                                match self.append_robot_response_event(&events_path, &event) {
+                                    Ok(events) => {
+                                        events_arrived_during_robot_wait.extend(events);
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            error = %error,
+                                            path = %events_path.display(),
+                                            "Failed to record human.response event"
+                                        );
+                                    }
+                                }
+                            }
+                            response_event = Some(event);
                         }
                         Ok(None) => {
                             warn!(
@@ -2728,6 +2991,64 @@ impl EventLoop {
             }
 
             human_interact_context = Some(Value::Object(context));
+        }
+
+        let intervening_count = events_arrived_during_robot_wait.len();
+        for (index, event) in events_arrived_during_robot_wait.into_iter().enumerate() {
+            let payload = event.payload.clone();
+
+            if !cancellation_topic.is_empty() && event.topic.as_str() == cancellation_topic {
+                info!(
+                    payload = %payload,
+                    "loop.cancel event detected during robot wait — scheduling graceful termination"
+                );
+                self.state.cancellation_requested = true;
+                continue;
+            }
+
+            if event.topic.as_str() == "human.guidance" {
+                self.state.unacknowledged_guidance.push(payload);
+                validated_events.push(event);
+                continue;
+            }
+
+            if event.topic.as_str() == "human.guidance.ack" {
+                info!(
+                    payload = %payload,
+                    guidance_count = self.state.unacknowledged_guidance.len(),
+                    "human.guidance acknowledged during robot wait"
+                );
+                self.state.unacknowledged_guidance.clear();
+                validated_events.push(event);
+                continue;
+            }
+
+            if event.topic.as_str() == completion_topic {
+                if index + 1 == intervening_count {
+                    self.state.completion_requested = true;
+                    self.diagnostics.log_orchestration(
+                        self.state.iteration,
+                        "jsonl",
+                        crate::diagnostics::OrchestrationEvent::EventPublished {
+                            topic: event.topic.to_string(),
+                        },
+                    );
+                    info!(
+                        topic = %event.topic,
+                        "Completion event detected during robot wait"
+                    );
+                } else {
+                    warn!(
+                        topic = %event.topic,
+                        index = index,
+                        total_events = intervening_count,
+                        "Completion event during robot wait ignored because it was not the last event"
+                    );
+                }
+                continue;
+            }
+
+            validated_events.push(event);
         }
 
         let restart_requested = validated_events.iter().any(Self::is_restart_request_event)
@@ -2787,6 +3108,131 @@ impl EventLoop {
             human_interact_context,
             has_orphans,
         })
+    }
+
+    fn append_robot_response_event(
+        &mut self,
+        events_path: &Path,
+        event: &Event,
+    ) -> std::io::Result<Vec<Event>> {
+        if let Some(parent) = events_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let reader_position = self.event_reader.position();
+        let before_len = std::fs::metadata(events_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let line = Self::serialize_jsonl_event(event)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(events_path)?;
+        writeln!(file, "{line}")?;
+        file.flush()?;
+        let after_len = std::fs::metadata(events_path)?.len();
+
+        if self.event_reader.path() == events_path && self.event_reader.position() == before_len {
+            self.event_reader.set_position(after_len);
+            return Ok(Vec::new());
+        }
+
+        if self.event_reader.path() == events_path && reader_position < before_len {
+            let intervening_events =
+                Self::read_jsonl_events_between(events_path, reader_position, before_len)?;
+            self.event_reader.set_position(after_len);
+            return Ok(intervening_events);
+        }
+
+        Ok(Vec::new())
+    }
+
+    fn serialize_jsonl_event(event: &Event) -> std::io::Result<String> {
+        let mut value = serde_json::json!({
+            "topic": event.topic.as_str(),
+            "payload": event.payload,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        });
+
+        if let Some(wave_id) = &event.wave_id {
+            value["wave_id"] = Value::String(wave_id.clone());
+        }
+        if let Some(wave_index) = event.wave_index {
+            value["wave_index"] = Value::from(wave_index);
+        }
+        if let Some(wave_total) = event.wave_total {
+            value["wave_total"] = Value::from(wave_total);
+        }
+
+        serde_json::to_string(&value).map_err(std::io::Error::other)
+    }
+
+    fn skip_consumed_robot_response_event(
+        &mut self,
+        events_path: &Path,
+        response: &str,
+    ) -> Vec<Event> {
+        if self.event_reader.path() != events_path {
+            return Vec::new();
+        }
+
+        let Ok(mut file) = std::fs::File::open(events_path) else {
+            return Vec::new();
+        };
+        let mut current_pos = self.event_reader.position();
+        if file.seek(SeekFrom::Start(current_pos)).is_err() {
+            return Vec::new();
+        }
+
+        let mut intervening_events = Vec::new();
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                return intervening_events;
+            };
+            current_pos += line.len() as u64 + 1;
+
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let Ok(event) = serde_json::from_str::<crate::event_reader::Event>(&line) else {
+                continue;
+            };
+            if event.topic == "human.response" && event.payload.as_deref() == Some(response) {
+                self.event_reader.set_position(current_pos);
+                return intervening_events;
+            }
+            intervening_events.push(event.into());
+        }
+        intervening_events
+    }
+
+    fn read_jsonl_events_between(
+        events_path: &Path,
+        start: u64,
+        end: u64,
+    ) -> std::io::Result<Vec<Event>> {
+        let mut file = std::fs::File::open(events_path)?;
+        file.seek(SeekFrom::Start(start))?;
+
+        let reader = BufReader::new(file);
+        let mut current_pos = start;
+        let mut events = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            current_pos += line.len() as u64 + 1;
+            if current_pos > end {
+                break;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<crate::event_reader::Event>(&line) {
+                events.push(event.into());
+            }
+        }
+        Ok(events)
     }
 
     /// Process events from JSONL, partitioning wave events from regular events.
