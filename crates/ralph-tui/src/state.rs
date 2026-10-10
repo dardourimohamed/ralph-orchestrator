@@ -341,7 +341,7 @@ impl TuiState {
             last_event: None,
             last_event_at: None,
             show_help: false,
-            mouse_capture_enabled: false,
+            mouse_capture_enabled: true,
             in_scroll_mode: false,
             search_query: String::new(),
             search_forward: true,

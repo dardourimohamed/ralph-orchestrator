@@ -272,6 +272,13 @@ impl<W: AsyncWrite + Unpin + Send + 'static> App<W> {
             let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
         }
 
+        // Request mouse capture per the state default so wheel scrolling
+        // works out of the box (tmux forwards SGR wheel events once
+        // tracking is enabled; `m` still toggles native text selection).
+        // Registered after the cleanup guard above so a failure here still
+        // leaves raw mode and the alternate screen restored.
+        set_mouse_capture(self.state.lock().unwrap().mouse_capture_enabled)?;
+
         let update_state = Arc::clone(&self.state);
         tokio::spawn(async move {
             let status = update_check::fetch_update_status().await;
@@ -867,13 +874,16 @@ mod tests {
     #[test]
     fn dispatch_action_toggle_mouse_mode_flips_state() {
         let mut state = TuiState::new();
+        assert!(
+            state.mouse_capture_enabled,
+            "mouse capture is on by default"
+        );
+
+        dispatch_action(Action::ToggleMouseMode, &mut state, 10);
         assert!(!state.mouse_capture_enabled);
 
         dispatch_action(Action::ToggleMouseMode, &mut state, 10);
         assert!(state.mouse_capture_enabled);
-
-        dispatch_action(Action::ToggleMouseMode, &mut state, 10);
-        assert!(!state.mouse_capture_enabled);
     }
 
     #[test]
@@ -1021,10 +1031,10 @@ mod tests {
     }
 
     #[test]
-    fn mouse_capture_starts_disabled_by_default() {
+    fn mouse_capture_starts_enabled_by_default() {
         assert!(
-            !TuiState::new().mouse_capture_enabled,
-            "Production TUI should start with mouse capture disabled so native text selection works by default"
+            TuiState::new().mouse_capture_enabled,
+            "Production TUI should start with mouse capture enabled so wheel scrolling works out of the box (incl. inside tmux)"
         );
     }
 }

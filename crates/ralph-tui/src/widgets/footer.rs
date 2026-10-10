@@ -164,14 +164,6 @@ impl Widget for Footer<'_> {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        if self.state.mouse_capture_enabled {
-            left_spans.push(Span::raw(" │ "));
-            left_spans.push(Span::styled(
-                "Mouse: scroll (m)",
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-
         let indicator_text = if self.state.loop_completed {
             "■ DONE"
         } else {
@@ -183,6 +175,25 @@ impl Widget for Footer<'_> {
         } else {
             Style::default().fg(Color::Green)
         };
+
+        // Show the mouse-mode hint only when it fits next to the right-side
+        // indicator; at narrow widths the footer truncates and would leave a
+        // stray separator behind.
+        let mouse_label = if self.state.mouse_capture_enabled {
+            "Mouse: scroll (m)"
+        } else {
+            "Mouse: select (m)"
+        };
+        let left_width: usize = left_spans.iter().map(|s| s.width()).sum();
+        if left_width + 3 + mouse_label.len() + indicator_text.len() + 2
+            <= inner_area.width as usize
+        {
+            left_spans.push(Span::raw(" │ "));
+            left_spans.push(Span::styled(
+                mouse_label,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
 
         // Calculate left content width for layout
         let left_content_width: usize = left_spans.iter().map(|s| s.width()).sum();
@@ -398,19 +409,19 @@ mod tests {
     #[test]
     fn footer_shows_mouse_mode() {
         let mut state = TuiState::new();
-        let select_text = render_to_string(&state);
-        assert!(
-            !select_text.contains("Mouse:"),
-            "should keep default footer uncluttered when mouse capture is off, got: {}",
-            select_text
-        );
-
-        state.mouse_capture_enabled = true;
         let scroll_text = render_to_string(&state);
         assert!(
             scroll_text.contains("Mouse: scroll (m)"),
-            "should show scroll mode when mouse capture enabled, got: {}",
+            "should show scroll mode by default when mouse capture is enabled, got: {}",
             scroll_text
+        );
+
+        state.mouse_capture_enabled = false;
+        let select_text = render_to_string(&state);
+        assert!(
+            select_text.contains("Mouse: select (m)"),
+            "should show select mode when mouse capture is disabled, got: {}",
+            select_text
         );
     }
 
