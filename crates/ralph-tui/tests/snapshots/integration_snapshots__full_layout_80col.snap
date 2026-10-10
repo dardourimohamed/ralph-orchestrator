@@ -2,7 +2,7 @@
 source: crates/ralph-tui/tests/integration_snapshots.rs
 expression: harness.render_full()
 ---
-[iter 1/1] [TIME] | 📋 Planner | [LIVE] | ? help
+[iter 1/1] [TIME] | 📋 Planner | [LIVE] | ~/ralph-orchestrator | ? help
 ────────────────────────────────────────────────────────────────────────────────
 Content line 1
 Content line 2

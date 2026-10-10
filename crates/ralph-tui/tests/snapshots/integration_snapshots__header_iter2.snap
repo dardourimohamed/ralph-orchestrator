@@ -2,4 +2,4 @@
 source: crates/ralph-tui/tests/integration_snapshots.rs
 expression: harness.render_header()
 ---
-[iter 1/0] [TIME] | 📋 Planner | [LIVE] | ? help                                  ────────────────────────────────────────────────────────────────────────────────
+[iter 1/0] [TIME] | 📋 Planner | [LIVE] | ~/ralph-orchestrator | ? help           ────────────────────────────────────────────────────────────────────────────────

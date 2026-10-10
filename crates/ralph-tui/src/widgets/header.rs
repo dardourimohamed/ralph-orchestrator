@@ -1,5 +1,8 @@
+use std::path::Path;
+use std::sync::LazyLock;
+
 use crate::state::{TuiState, UpdateStatus};
-use ralph_core::truncate_with_ellipsis;
+use ralph_core::{format_duration, truncate_with_ellipsis};
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
@@ -33,6 +36,33 @@ const WIDTH_MINIMAL: u16 = 40; // Hide idle countdown
 ///
 /// At narrower terminal widths, lower-priority components are hidden or compressed
 /// to ensure critical information (iteration, mode) remains visible.
+/// Home directory for display shortening (`~`), resolved once per process.
+///
+/// `HOME` with `USERPROFILE` fallback (see `config_resolution::home_dir_from_env`).
+fn home_dir() -> Option<&'static Path> {
+    static HOME: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+    });
+    HOME.as_deref()
+}
+
+/// Shortens a path for display: replaces the home directory prefix with `~`.
+#[must_use]
+fn shorten_dir(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Ok(stripped) = path.strip_prefix(home) {
+            return format!("~/{stripped}", stripped = stripped.display());
+        }
+    }
+    path.display().to_string()
+}
+
 pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
     let mut left_spans = vec![];
 
@@ -80,10 +110,10 @@ pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
             state.get_iteration_elapsed()
         };
         if let Some(elapsed) = elapsed {
-            let total_secs = elapsed.as_secs();
-            let mins = total_secs / 60;
-            let secs = total_secs % 60;
-            left_spans.push(Span::raw(format!(" {mins:02}:{secs:02}")));
+            left_spans.push(Span::raw(format!(
+                " {}",
+                format_duration(elapsed.as_secs())
+            )));
         }
     }
 
@@ -163,16 +193,24 @@ pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
         }
     }
 
-    if let Some(branch) = state.current_branch()
-        && width >= WIDTH_SHOW_BRANCH
-    {
-        let prefix = " | git:";
+    // Workspace location: directory (home-shortened) + git branch - hidden below WIDTH_SHOW_BRANCH
+    let mut location = String::new();
+    location.push_str(&shorten_dir(state.export_workspace_root(), home_dir()));
+    if let Some(branch) = state.current_branch() {
+        if !location.is_empty() {
+            location.push_str(" @ ");
+        }
+        location.push_str("git:");
+        location.push_str(branch);
+    }
+    if !location.is_empty() && width >= WIDTH_SHOW_BRANCH {
+        let prefix = " | ";
         let available_width = (width as usize).saturating_sub(spans_width(&left_spans));
 
         if available_width > prefix.len() + 3 {
-            let branch = truncate_with_ellipsis(branch, available_width - prefix.len());
+            let location = truncate_with_ellipsis(&location, available_width - prefix.len());
             left_spans.push(Span::styled(
-                format!("{prefix}{branch}"),
+                format!("{prefix}{location}"),
                 Style::default().fg(Color::Cyan),
             ));
         }
@@ -236,6 +274,7 @@ mod tests {
     use ralph_proto::{Event, HatId};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     fn render_to_string(state: &TuiState) -> String {
@@ -325,6 +364,48 @@ mod tests {
 
         let text = render_to_string(&state);
         assert!(text.contains("04:32"), "should show 04:32, got: {}", text);
+    }
+
+    #[test]
+    fn header_shows_iteration_elapsed_with_hours() {
+        let mut state = TuiState::new();
+        let event = Event::new("task.start", "");
+        state.update(&event);
+
+        // Simulate 2 hours 5 minutes 30 seconds elapsed
+        state.iteration_started = Some(
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(7_530))
+                .unwrap(),
+        );
+
+        let text = render_to_string(&state);
+        assert!(
+            text.contains("2:05:30"),
+            "should show hours as H:MM:SS, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn header_shows_iteration_elapsed_with_days() {
+        let mut state = TuiState::new();
+        let event = Event::new("task.start", "");
+        state.update(&event);
+
+        // Simulate 1 day 3 hours 5 seconds elapsed
+        state.iteration_started = Some(
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(97_505))
+                .unwrap(),
+        );
+
+        let text = render_to_string(&state);
+        assert!(
+            text.contains("1d 3:05"),
+            "should show days as Dd H:MM, got: {}",
+            text
+        );
     }
 
     #[test]
@@ -523,6 +604,7 @@ mod tests {
         state.pending_hat = Some((HatId::new("builder"), "🔨Builder".to_string()));
         state.idle_timeout_remaining = Some(Duration::from_secs(25));
         state.in_scroll_mode = true;
+        state.set_export_workspace_root(PathBuf::from("/proj"));
 
         let text = render_to_string(&state);
 
@@ -585,7 +667,8 @@ mod tests {
     #[test]
     fn header_at_80_chars_shows_help_hint() {
         // At 80+ chars, help hint should be visible
-        let state = create_full_state();
+        let mut state = create_full_state();
+        state.set_export_workspace_root(PathBuf::from("/proj"));
         let text = render_to_string_with_width(&state, 80);
 
         // Should contain help hint
@@ -720,9 +803,10 @@ mod tests {
     #[test]
     fn header_shows_branch_on_wide_terminal() {
         let mut state = create_full_state();
+        state.set_export_workspace_root(PathBuf::from("/srv/work/proj"));
         state.set_current_branch(Some("feature/show-branch".to_string()));
 
-        let text = render_to_string_with_width(&state, 80);
+        let text = render_to_string_with_width(&state, 100);
         assert!(
             text.contains("git:feature"),
             "branch prefix should be visible on wide terminals, got: {}",
@@ -745,6 +829,94 @@ mod tests {
             !text.contains("git:main"),
             "branch should be hidden on compact terminals, got: {}",
             text
+        );
+    }
+
+    #[test]
+    fn header_shows_workspace_dir_with_branch() {
+        let mut state = create_full_state();
+        state.set_export_workspace_root(PathBuf::from("/srv/work/proj"));
+        state.set_current_branch(Some("main".to_string()));
+
+        let text = render_to_string_with_width(&state, 100);
+        assert!(
+            text.contains("/srv/work/proj @ git:main"),
+            "directory with branch should be visible, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn header_shows_workspace_dir_alone() {
+        let mut state = create_full_state();
+        state.set_export_workspace_root(PathBuf::from("/srv/work/proj"));
+
+        let text = render_to_string_with_width(&state, 80);
+        assert!(
+            text.contains("| /srv/work/proj"),
+            "directory should be visible without a branch, got: {}",
+            text
+        );
+        assert!(
+            !text.contains("git:"),
+            "no branch prefix when branch is unknown, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn header_hides_workspace_dir_on_compact_terminal() {
+        let mut state = create_full_state();
+        state.set_export_workspace_root(PathBuf::from("/srv/work/proj"));
+        state.set_current_branch(Some("main".to_string()));
+
+        let text = render_to_string_with_width(&state, 50);
+        assert!(
+            !text.contains("/srv/work/proj"),
+            "directory should be hidden on compact terminals, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn shorten_dir_replaces_home_prefix() {
+        let home = Path::new("/home/med");
+        assert_eq!(
+            shorten_dir(Path::new("/home/med/projects/foo"), Some(home)),
+            "~/projects/foo"
+        );
+    }
+
+    #[test]
+    fn shorten_dir_replaces_home_itself() {
+        let home = Path::new("/home/med");
+        assert_eq!(shorten_dir(home, Some(home)), "~");
+    }
+
+    #[test]
+    fn shorten_dir_keeps_path_outside_home() {
+        let home = Path::new("/home/med");
+        assert_eq!(
+            shorten_dir(Path::new("/srv/work/proj"), Some(home)),
+            "/srv/work/proj"
+        );
+    }
+
+    #[test]
+    fn shorten_dir_without_home() {
+        assert_eq!(
+            shorten_dir(Path::new("/home/med/projects/foo"), None),
+            "/home/med/projects/foo"
+        );
+    }
+
+    #[test]
+    fn shorten_dir_does_not_match_longer_home_prefix() {
+        // `/home/med2` must not be treated as inside `/home/med`
+        let home = Path::new("/home/med");
+        assert_eq!(
+            shorten_dir(Path::new("/home/med2/proj"), Some(home)),
+            "/home/med2/proj"
         );
     }
 

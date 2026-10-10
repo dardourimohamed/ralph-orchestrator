@@ -1,4 +1,5 @@
 use crate::state::{ExportOutcome, TuiState};
+use ralph_core::format_duration;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
@@ -149,10 +150,7 @@ impl Widget for Footer<'_> {
 
         // Show total elapsed time (default to 00:00 if loop hasn't started)
         let elapsed_display = if let Some(elapsed) = self.state.get_loop_elapsed() {
-            let total_secs = elapsed.as_secs();
-            let mins = total_secs / 60;
-            let secs = total_secs % 60;
-            format!("Total Time Elapsed: {mins:02}:{secs:02}")
+            format!("Total Time Elapsed: {}", format_duration(elapsed.as_secs()))
         } else {
             "Total Time Elapsed: 00:00".to_string()
         };
@@ -300,6 +298,44 @@ mod tests {
         assert!(
             text.contains("Total Time Elapsed: 02:30"),
             "should show 'Total Time Elapsed: 02:30', got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn footer_shows_total_elapsed_with_hours() {
+        // Given loop has been running for 2 hours 5 minutes 30 seconds
+        let mut state = TuiState::new();
+        state.loop_started = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(7_530))
+                .unwrap(),
+        );
+
+        let text = render_to_string(&state);
+
+        assert!(
+            text.contains("Total Time Elapsed: 2:05:30"),
+            "should show hours as H:MM:SS, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn footer_shows_total_elapsed_with_days() {
+        // Given loop has been running for 1 day 3 hours 5 seconds
+        let mut state = TuiState::new();
+        state.loop_started = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(97_505))
+                .unwrap(),
+        );
+
+        let text = render_to_string(&state);
+
+        assert!(
+            text.contains("Total Time Elapsed: 1d 3:05"),
+            "should show days as Dd H:MM, got: {}",
             text
         );
     }

@@ -134,7 +134,7 @@ pub use task_definition::{
     TaskDefinition, TaskDefinitionError, TaskSetup, TaskSuite, Verification,
 };
 pub use task_store::TaskStore;
-pub use text::{floor_char_boundary, truncate_with_ellipsis};
+pub use text::{floor_char_boundary, format_duration, truncate_with_ellipsis};
 pub use urgent_steer::{UrgentSteerRecord, UrgentSteerStore};
 pub use wave_detection::{DetectedWave, detect_wave_events, resolve_aggregate_wait};
 pub use wave_prompt::{WaveWorkerContext, build_wave_worker_prompt};

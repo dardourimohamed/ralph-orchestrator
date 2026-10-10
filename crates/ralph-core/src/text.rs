@@ -86,6 +86,38 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Formats a duration as a compact human-readable string for display.
+///
+/// Grows in precision as the duration grows:
+/// - under 1 hour: `MM:SS` (e.g. `04:32`)
+/// - under 1 day: `H:MM:SS` (e.g. `2:05:30`)
+/// - 1 day or more: `Dd H:MM` (e.g. `1d 3:05`)
+///
+/// # Examples
+///
+/// ```
+/// use ralph_core::format_duration;
+///
+/// assert_eq!(format_duration(42), "00:42");
+/// assert_eq!(format_duration(272), "04:32");
+/// assert_eq!(format_duration(7530), "2:05:30");
+/// assert_eq!(format_duration(97_500), "1d 3:05");
+/// ```
+#[must_use]
+pub fn format_duration(total_secs: u64) -> String {
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let mins = (total_secs % 3_600) / 60;
+    let secs = total_secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}:{mins:02}")
+    } else if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +211,27 @@ mod tests {
     fn test_single_char_truncation() {
         assert_eq!(truncate_with_ellipsis("hello", 1), "h");
         assert_eq!(truncate_with_ellipsis("🎉hello", 1), "🎉");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(0), "00:00");
+        assert_eq!(format_duration(42), "00:42");
+        assert_eq!(format_duration(272), "04:32");
+        assert_eq!(format_duration(59 * 60 + 59), "59:59");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(3_600), "1:00:00");
+        assert_eq!(format_duration(7_530), "2:05:30");
+        assert_eq!(format_duration(86_399), "23:59:59");
+    }
+
+    #[test]
+    fn test_format_duration_days() {
+        assert_eq!(format_duration(86_400), "1d 0:00");
+        assert_eq!(format_duration(97_500), "1d 3:05");
+        assert_eq!(format_duration(3 * 86_400 + 21 * 3_600 + 5), "3d 21:00");
     }
 }
