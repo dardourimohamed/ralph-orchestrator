@@ -5,7 +5,8 @@ event_loop:
   starting_event: work.start
 
 cli:
-  backend: pi
+  backend: omp
+  show_thinking: true
 
 core:
   specs_dir: ./specs/

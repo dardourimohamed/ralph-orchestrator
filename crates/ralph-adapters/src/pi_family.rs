@@ -113,6 +113,11 @@ pub struct PiFamilyTurnMessage {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub usage: Option<PiFamilyUsage>,
+    /// Backend error payload (present when the turn stops with an error,
+    /// e.g. OMP's `stopReason:"error"` carries the provider's HTTP error).
+    /// Surfaced via [`StreamHandler::on_error`].
+    #[serde(rename = "errorMessage")]
+    pub error_message: Option<String>,
     /// Assistant content blocks. Real Pi/OMP turn_end fixtures carry this; it is
     /// the source of the mandatory final assistant text fallback. Optional
     /// because some records omit it.
@@ -248,9 +253,9 @@ impl PiFamilySessionState {
 
     /// Parse one complete NDJSON line, update counts, and dispatch any typed
     /// event. Owns blank/malformed-line tolerance: blank lines are skipped
-    /// silently; malformed lines are counted and (via [`PiFamilyStreamParser`])
-    /// logged at debug with a bounded preview. `Other` events are dispatched as
-    /// no-ops and do not count as recognized.
+    /// silently; malformed lines (backend human log lines) are surfaced via
+    /// [`StreamHandler::on_log`] and counted for the protocol-mismatch check.
+    /// `Other` events are dispatched as no-ops and do not count as recognized.
     pub fn process_line<H: StreamHandler>(&mut self, line: &str, handler: &mut H, verbose: bool) {
         if line.trim().is_empty() {
             return;
@@ -262,7 +267,12 @@ impl PiFamilySessionState {
                 }
                 dispatch_pi_family_event(event, handler, self, verbose);
             }
-            None => self.malformed_lines += 1,
+            None => {
+                // Non-NDJSON line: the backend's own log output — surface it
+                // and still count it as malformed for the mismatch check.
+                handler.on_log(line);
+                self.malformed_lines += 1;
+            }
         }
     }
 
@@ -388,7 +398,7 @@ pub fn dispatch_pi_family_event<H: StreamHandler>(
             }
             PiFamilyAssistantEvent::ThinkingDelta { delta } => {
                 if verbose {
-                    handler.on_text(&delta);
+                    handler.on_thinking(&delta);
                 }
             }
             PiFamilyAssistantEvent::Error { reason } => {
@@ -430,6 +440,11 @@ pub fn dispatch_pi_family_event<H: StreamHandler>(
             if let Some(msg) = &message {
                 state.last_stop_reason = msg.stop_reason.clone();
                 state.last_turn_content = msg.content.clone();
+                if let Some(error) = &msg.error_message
+                    && !error.is_empty()
+                {
+                    handler.on_error(error);
+                }
                 if let Some(provider) = &msg.provider
                     && !provider.is_empty()
                 {
@@ -641,6 +656,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_turn_end_error_message() {
+        let json = r#"{"type":"turn_end","message":{"content":[],"stopReason":"error","errorStatus":400,"errorMessage":"400 max_completion_tokens=131072 cannot be greater than max_model_len=128000"}}"#;
+        let event = PiFamilyStreamParser::parse_line(json).unwrap();
+
+        let PiFamilyEvent::TurnEnd { message } = event else {
+            panic!("Expected TurnEnd, got {event:?}");
+        };
+        let msg = message.unwrap();
+        assert_eq!(msg.stop_reason.as_deref(), Some("error"));
+        assert!(
+            msg.error_message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("400 ")),
+            "error message must be parsed: {msg:?}"
+        );
+    }
+
+    #[test]
     fn test_parse_unknown_event_type() {
         // session, agent_start, turn_start, etc. should all parse as Other
         let json = r#"{"type":"session","version":3,"id":"uuid","timestamp":"2026-02-05T02:39:26.125Z","cwd":"/tmp"}"#;
@@ -718,12 +751,16 @@ mod tests {
         tool_calls: Vec<(String, String, serde_json::Value)>,
         tool_results: Vec<(String, String)>,
         errors: Vec<String>,
+        logs: Vec<String>,
         completions: Vec<SessionResult>,
     }
 
     impl StreamHandler for RecordingHandler {
         fn on_text(&mut self, text: &str) {
             self.texts.push(text.to_string());
+        }
+        fn on_log(&mut self, line: &str) {
+            self.logs.push(line.to_string());
         }
         fn on_tool_call(&mut self, name: &str, id: &str, input: &serde_json::Value) {
             self.tool_calls
@@ -755,6 +792,39 @@ mod tests {
 
         assert_eq!(handler.texts, vec!["Hello"]);
         assert_eq!(state.extracted_text, "Hello");
+    }
+
+    #[test]
+    fn test_process_line_malformed_surfaces_log_line() {
+        let mut handler = RecordingHandler::default();
+        let mut state = PiFamilySessionState::new();
+
+        state.process_line("plain backend log line", &mut handler, false);
+
+        assert_eq!(handler.logs, vec!["plain backend log line".to_string()]);
+        assert!(handler.texts.is_empty(), "log line is not assistant text");
+        assert!(state.extracted_text.is_empty());
+    }
+
+    #[test]
+    fn test_process_line_turn_end_error_surfaces() {
+        let mut handler = RecordingHandler::default();
+        let mut state = PiFamilySessionState::new();
+
+        state.process_line(
+            r#"{"type":"turn_end","message":{"content":[],"stopReason":"error","errorMessage":"400 provider rejected the request"}}"#,
+            &mut handler,
+            false,
+        );
+
+        assert_eq!(
+            handler.errors,
+            vec!["400 provider rejected the request".to_string()]
+        );
+        assert!(
+            state.extracted_text.is_empty(),
+            "error text is not assistant text"
+        );
     }
 
     #[test]
@@ -889,6 +959,7 @@ mod tests {
                         cache_write: 0,
                         cost: Some(PiFamilyCost { total: cost }),
                     }),
+                    error_message: None,
                     content: None,
                 }),
             };
@@ -910,6 +981,7 @@ mod tests {
                 provider: None,
                 model: None,
                 usage: None,
+                error_message: None,
                 content: None,
             }),
         };
@@ -1022,6 +1094,7 @@ mod tests {
                 provider: Some("anthropic".to_string()),
                 model: Some("claude-sonnet-4".to_string()),
                 usage: None,
+                error_message: None,
                 content: None,
             }),
         };

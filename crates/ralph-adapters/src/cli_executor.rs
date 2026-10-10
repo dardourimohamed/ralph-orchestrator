@@ -3,12 +3,14 @@
 //! Executes prompts via CLI tools with real-time streaming output.
 //! Supports optional execution timeout with graceful SIGTERM termination.
 
+use crate::claude_stream::ClaudeStreamParser;
 #[cfg(test)]
 use crate::cli_backend::PromptMode;
 use crate::cli_backend::{CliBackend, OutputFormat};
 use crate::copilot_stream::CopilotStreamParser;
 use crate::pi_family::PiFamilySessionState;
-use crate::stream_handler::{SessionResult, StreamHandler};
+use crate::pty_executor::{ClaudeSessionState, dispatch_stream_event};
+use crate::stream_handler::{SessionResult, StreamHandler, ThinkingBlock};
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
@@ -35,13 +37,13 @@ pub struct ExecutionResult {
     pub exit_code: Option<i32>,
     /// Whether the execution was terminated due to timeout.
     pub timed_out: bool,
-    /// Parsed assistant text for Pi-family NDJSON backends (the processor owns
-    /// extraction; the mandatory final-text fallback is already applied). `None`
-    /// for backends that keep using raw/normalized output (Claude stream-json,
-    /// Copilot, Text).
+    /// Parsed assistant text for structured NDJSON backends (Pi family,
+    /// Claude stream-json; the processor owns extraction). `None` for
+    /// backends that keep using raw/normalized output (Copilot, Text).
     pub extracted_text: Option<String>,
     /// Structured session result (metrics + merged `is_error`) for Pi-family
-    /// NDJSON backends. `None` for backends that do not parse a session.
+    /// and Claude stream-json backends. `None` for backends that do not parse
+    /// a session, or when no `Result` event was observed.
     pub session_result: Option<SessionResult>,
     /// Protocol-mismatch error surfaced when a successful Pi-family process
     /// produced no usable signal or no recoverable assistant text. `None`
@@ -53,6 +55,10 @@ pub struct ExecutionResult {
 #[derive(Debug)]
 pub struct CliExecutor {
     backend: CliBackend,
+    // Surface backend thinking blocks in the writer output even when not
+    // verbose. Set via set_show_thinking() from `cli.show_thinking` or
+    // RALPH_SHOW_THINKING=1.
+    show_thinking: bool,
 }
 
 enum StreamEvent {
@@ -70,7 +76,16 @@ enum StreamKind {
 impl CliExecutor {
     /// Creates a new executor with the given backend.
     pub fn new(backend: CliBackend) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            show_thinking: false,
+        }
+    }
+
+    /// Enables or disables display of backend thinking blocks in the
+    /// writer output (in addition to verbose mode).
+    pub fn set_show_thinking(&mut self, enabled: bool) {
+        self.show_thinking = enabled;
     }
 
     /// Executes a prompt and streams output to the provided writer.
@@ -80,8 +95,10 @@ impl CliExecutor {
     /// no stdout/stderr activity for longer than that duration, the process
     /// receives SIGTERM and the result indicates timeout.
     ///
-    /// When `verbose` is true, stderr output is also written to the output writer
-    /// with a `[stderr]` prefix. When false, stderr is captured but not displayed.
+    /// When `verbose` is true, stderr output is also written to the output
+    /// writer with a `[stderr]` prefix. When false, stderr is captured but
+    /// not displayed — except for the OMP backend, whose stderr is its log
+    /// channel and is always displayed.
     pub async fn execute<W: Write + Send>(
         &self,
         prompt: &str,
@@ -178,7 +195,23 @@ impl CliExecutor {
             } else {
                 "Pi"
             };
+
+        // OMP's stderr is its log channel: surface it even without verbose.
+        let show_stderr =
+            verbose || matches!(self.backend.output_format, OutputFormat::OmpStreamJson);
+        // Claude stream-json console runs parse through the same dispatcher
+        // as the PTY path so plain output is readable text (not raw NDJSON)
+        // and thinking blocks honor the same show_thinking gate.
+        let is_claude_stream_json = self.backend.output_format == OutputFormat::StreamJson;
+        let mut claude_state = ClaudeSessionState::new();
+        let mut claude_extracted_text = String::new();
+        let mut claude_session_result: Option<SessionResult> = None;
         let start_time = Instant::now();
+
+        // Thinking block state for the user-facing writer. Owned across the
+        // stream loop because the pi-family/Claude handlers below are
+        // constructed per line and must share one open/close state.
+        let mut thinking = ThinkingBlock::default();
 
         if let Some(duration) = timeout {
             debug!(
@@ -236,8 +269,31 @@ impl CliExecutor {
                         // writer-backed handler so the user sees readable text
                         // (mirrors the Copilot arm). Raw NDJSON is still
                         // accumulated below for loop post-processing.
-                        let mut handler = WriterStreamHandler::new(&mut output_writer);
-                        family_state.process_line(&line, &mut handler, verbose);
+                        let mut handler =
+                            WriterStreamHandler::new(&mut output_writer, &mut thinking);
+                        family_state.process_line(
+                            &line,
+                            &mut handler,
+                            verbose || self.show_thinking,
+                        );
+                    } else if is_claude_stream_json {
+                        // Claude stream-json: readable text via the shared
+                        // dispatcher (mirrors the PTY path); raw NDJSON is
+                        // still accumulated below for loop post-processing.
+                        if let Some(event) = ClaudeStreamParser::parse_line(&line) {
+                            let mut handler =
+                                WriterStreamHandler::new(&mut output_writer, &mut thinking);
+                            if let Some(sr) = dispatch_stream_event(
+                                event,
+                                &mut handler,
+                                &mut claude_extracted_text,
+                                &mut claude_state,
+                                0,
+                                verbose || self.show_thinking,
+                            ) {
+                                claude_session_result = Some(sr);
+                            }
+                        }
                     } else {
                         writeln!(output_writer, "{line}")?;
                     }
@@ -253,7 +309,8 @@ impl CliExecutor {
                             tokio::time::Instant::now() + TEXT_POST_EVENT_GRACE_TIMEOUT
                         });
                     }
-                    if verbose {
+                    if show_stderr {
+                        thinking.close(&mut output_writer);
                         writeln!(output_writer, "[stderr] {line}")?;
                         output_writer.flush()?;
                     }
@@ -270,6 +327,10 @@ impl CliExecutor {
             }
         }
 
+        // Close any thinking block still open at end of stream so a
+        // thinking-final session does not leave an unlabeled, unterminated
+        // dimmed run in the writer.
+        thinking.close(&mut output_writer);
         let status = if let Some(status) = terminated_status {
             status
         } else {
@@ -311,6 +372,11 @@ impl CliExecutor {
                 Some(session_result),
                 summary.protocol_error,
             )
+        } else if is_claude_stream_json {
+            match claude_session_result {
+                Some(sr) => (!sr.is_error, Some(claude_extracted_text), Some(sr), None),
+                None => (status.success() && !timed_out, None, None, None),
+            }
         } else {
             (status.success() && !timed_out, None, None, None)
         };
@@ -455,20 +521,32 @@ fn inject_ralph_runtime_env(command: &mut Command, workspace_root: &std::path::P
 /// (`execute_capture`) and must never abort the stream.
 struct WriterStreamHandler<'a, W: Write> {
     writer: &'a mut W,
+    thinking: &'a mut ThinkingBlock,
 }
 
 impl<'a, W: Write> WriterStreamHandler<'a, W> {
-    fn new(writer: &'a mut W) -> Self {
-        Self { writer }
+    fn new(writer: &'a mut W, thinking: &'a mut ThinkingBlock) -> Self {
+        Self { writer, thinking }
     }
 }
 
 impl<W: Write + Send> StreamHandler for WriterStreamHandler<'_, W> {
     fn on_text(&mut self, text: &str) {
+        self.thinking.close(self.writer);
         let _ = self.writer.write_all(text.as_bytes());
     }
 
+    fn on_thinking(&mut self, text: &str) {
+        self.thinking.write(self.writer, text);
+    }
+
+    fn on_log(&mut self, line: &str) {
+        self.thinking.close(self.writer);
+        let _ = writeln!(self.writer, "{}", line);
+    }
+
     fn on_tool_call(&mut self, name: &str, _id: &str, input: &serde_json::Value) {
+        self.thinking.close(self.writer);
         match crate::tool_preview::format_tool_summary(name, input) {
             Some(summary) => {
                 let _ = writeln!(self.writer, "[Tool] {name}: {summary}");
@@ -480,6 +558,7 @@ impl<W: Write + Send> StreamHandler for WriterStreamHandler<'_, W> {
     }
 
     fn on_tool_result(&mut self, _id: &str, output: &str) {
+        self.thinking.close(self.writer);
         let display = crate::tool_preview::format_tool_result(output);
         if !display.is_empty() {
             let _ = writeln!(self.writer, "[Result] {display}");
@@ -487,12 +566,12 @@ impl<W: Write + Send> StreamHandler for WriterStreamHandler<'_, W> {
     }
 
     fn on_error(&mut self, error: &str) {
+        self.thinking.close(self.writer);
         let _ = writeln!(self.writer, "[Error] {error}");
     }
 
     fn on_complete(&mut self, _result: &SessionResult) {
-        // The no-TUI executor builds the SessionResult via the processor's
-        // `finalize()`; nothing to render here.
+        self.thinking.close(self.writer);
     }
 }
 
@@ -912,6 +991,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_pi_stream_thinking_console_flag() {
+        // Thinking deltas are hidden from the user-facing writer unless the
+        // console flag (cli.show_thinking / RALPH_SHOW_THINKING=1) is set, and
+        let make_backend = || {
+            CliBackend {
+            command: "printf".to_string(),
+            args: vec![
+                "%s\n%s\n%s\n%s\n".to_string(),
+                r#"{"type":"session","version":3}"#.to_string(),
+                r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"secret thinking"}}"#
+                    .to_string(),
+                r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"final answer"}}"#
+                    .to_string(),
+                r#"{"type":"turn_end","message":{"content":[],"stopReason":"stop"}}"#.to_string(),
+            ],
+            prompt_mode: PromptMode::Stdin,
+            prompt_flag: None,
+            output_format: OutputFormat::PiStreamJson,
+            env_vars: vec![],
+        }
+        };
+
+        // Default: thinking hidden from the writer (verbose false).
+        let executor = CliExecutor::new(make_backend());
+        let mut output = Vec::new();
+        let result = executor
+            .execute("ignored", &mut output, None, false)
+            .await
+            .unwrap();
+        assert!(result.success);
+        let written = String::from_utf8(output).unwrap();
+        assert!(
+            !written.contains("secret thinking"),
+            "thinking must be hidden without the console flag: {written:?}"
+        );
+        assert_eq!(written, "final answer");
+        assert_eq!(result.extracted_text, Some("final answer".to_string()));
+
+        // Flag set: thinking surfaced in the writer, still not in extracted.
+        let mut executor = CliExecutor::new(make_backend());
+        executor.set_show_thinking(true);
+        let mut output = Vec::new();
+        let result = executor
+            .execute("ignored", &mut output, None, false)
+            .await
+            .unwrap();
+        assert!(result.success);
+        let written = String::from_utf8(output).unwrap();
+        let label = written
+            .find("[thinking]")
+            .expect("thinking must be labeled with the console flag");
+        let think = written
+            .find("secret thinking")
+            .expect("full thinking content must be shown with the console flag");
+        let answer = written
+            .find("final answer")
+            .expect("assistant answer must still be shown");
+        assert!(
+            label < think && think < answer,
+            "order must be label, thinking body, answer: {written:?}"
+        );
+        assert!(
+            written[..think].contains("\u{1b}[2m"),
+            "thinking must carry the dim SGR attribute: {written:?}"
+        );
+        let close = written
+            .find('\u{2514}')
+            .expect("thinking block must close with a separator: {written:?}");
+        assert!(
+            think < close && close < answer,
+            "order must be label, thinking body, separator, answer: {written:?}"
+        );
+        assert_eq!(result.extracted_text, Some("final answer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_pi_stream_thinking_only_closes_at_end() {
+        // A stream that ends on a thinking block (no trailing text) must
+        // still close the block at finalization: labeled open, full content,
+        // separator at the end, and thinking kept out of extracted_text.
+        let backend = CliBackend {
+            command: "printf".to_string(),
+            args: vec![
+                "%s\n%s\n%s\n".to_string(),
+                r#"{"type":"session","version":3}"#.to_string(),
+                r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"trailing thoughts"}}"#
+                    .to_string(),
+                r#"{"type":"turn_end","message":{"content":[],"stopReason":"stop"}}"#.to_string(),
+            ],
+            prompt_mode: PromptMode::Stdin,
+            prompt_flag: None,
+            output_format: OutputFormat::PiStreamJson,
+            env_vars: vec![],
+        };
+        let mut executor = CliExecutor::new(backend);
+        executor.set_show_thinking(true);
+        let mut output = Vec::new();
+        let result = executor
+            .execute("ignored", &mut output, None, false)
+            .await
+            .unwrap();
+        let written = String::from_utf8(output).unwrap();
+        let label = written
+            .find("[thinking]")
+            .expect("thinking block must be labeled: {written:?}");
+        let think = written
+            .find("trailing thoughts")
+            .expect("full thinking content must be shown: {written:?}");
+        let close = written
+            .find('\u{2514}')
+            .expect("thinking block must close at stream end: {written:?}");
+        assert!(
+            label < think && think < close,
+            "order must be label, body, close: {written:?}"
+        );
+        // Thinking-only streams have zero recoverable assistant text, so the
+        // processor reports a protocol mismatch — expected, not a regression.
+        assert!(result.protocol_error.is_some());
+        assert!(
+            result
+                .extracted_text
+                .as_deref()
+                .is_none_or(|t| !t.contains("trailing thoughts")),
+            "thinking must not enter extracted_text: {:?}",
+            result.extracted_text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_claude_stream_thinking_console_flag() {
+        // Claude stream-json thinking blocks are hidden from the user-facing
+        // writer unless the console flag (cli.show_thinking /
+        // RALPH_SHOW_THINKING=1) is set, and never enter extracted_text
+        // regardless. Text in the same assistant message must survive.
+        let make_backend = || {
+            CliBackend {
+            command: "printf".to_string(),
+            args: vec![
+                "%s\n%s\n%s\n".to_string(),
+                r#"{"type":"system","session_id":"s1","model":"m","tools":[]}"#.to_string(),
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"secret thinking","signature":"sig"},{"type":"text","text":"final answer"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#.to_string(),
+                r#"{"type":"result","duration_ms":5,"total_cost_usd":0.01,"num_turns":1,"is_error":false}"#
+                    .to_string(),
+            ],
+            prompt_mode: PromptMode::Stdin,
+            prompt_flag: None,
+            output_format: OutputFormat::StreamJson,
+            env_vars: vec![],
+        }
+        };
+
+        // Default: thinking hidden from the writer (verbose false).
+        let executor = CliExecutor::new(make_backend());
+        let mut output = Vec::new();
+        let result = executor
+            .execute("ignored", &mut output, None, false)
+            .await
+            .unwrap();
+        assert!(result.success);
+        let written = String::from_utf8(output).unwrap();
+        assert!(
+            !written.contains("secret thinking"),
+            "thinking must be hidden without the console flag: {written:?}"
+        );
+        assert_eq!(written, "final answer");
+        assert_eq!(result.extracted_text, Some("final answer\n".to_string()));
+        assert!(result.session_result.is_some());
+        assert!(!result.session_result.as_ref().unwrap().is_error);
+
+        // Flag set: thinking surfaced in the writer, still not in extracted.
+        let mut executor = CliExecutor::new(make_backend());
+        executor.set_show_thinking(true);
+        let mut output = Vec::new();
+        let result = executor
+            .execute("ignored", &mut output, None, false)
+            .await
+            .unwrap();
+        assert!(result.success);
+        let written = String::from_utf8(output).unwrap();
+        let label = written
+            .find("[thinking]")
+            .expect("thinking must be labeled with the console flag");
+        let start = written
+            .find("secret thinking")
+            .expect("thinking must be shown with the console flag");
+        let answer = written
+            .find("final answer")
+            .expect("assistant answer must still be shown");
+        assert!(
+            label < start && start < answer,
+            "order must be label, thinking body, answer: {written:?}"
+        );
+        assert!(
+            written[..start].contains("\u{1b}[2m"),
+            "thinking must carry the dim SGR attribute: {written:?}"
+        );
+        let close = written
+            .find('\u{2514}')
+            .expect("thinking block must close with a separator: {written:?}");
+        assert!(
+            start < close && close < answer,
+            "order must be label, thinking body, separator, answer: {written:?}"
+        );
+        assert_eq!(result.extracted_text, Some("final answer\n".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_execute_pi_stream_protocol_mismatch_no_usable_events() {
         // A successful Pi process that emits only header/unknown records must
         // NOT be a silent empty success. It surfaces a protocol error (case 1)
@@ -1027,6 +1313,64 @@ mod tests {
             result.protocol_error.is_none(),
             "clean OMP stream must not surface a protocol error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_omp_stream_surfaces_backend_logs() {
+        // OMP writes human log lines that are not NDJSON (stdout) and logs to
+        // stderr: both must reach the user-facing writer without verbose,
+        // without polluting extracted_text or the raw accumulated output.
+        let backend = CliBackend {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo '[omp] stderr start' >&2; printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \
+                 '{\"type\":\"session\",\"version\":3}' \
+                 'omp plain stdout log' \
+                 '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"final answer\"}}' \
+                 '{\"type\":\"turn_end\",\"message\":{\"content\":[],\"stopReason\":\"stop\"}}' \
+                 '{\"type\":\"agent_end\"}'; \
+                 echo '[omp] stderr end' >&2".to_string(),
+            ],
+            prompt_mode: PromptMode::Stdin,
+            prompt_flag: None,
+            output_format: OutputFormat::OmpStreamJson,
+            env_vars: vec![],
+        };
+
+        let executor = CliExecutor::new(backend);
+        let mut output = Vec::new();
+
+        let result = executor
+            .execute("ignored", &mut output, None, false)
+            .await
+            .unwrap();
+
+        let written = String::from_utf8(output).unwrap();
+        assert!(
+            written.contains("omp plain stdout log"),
+            "non-NDJSON stdout log must be shown: {written:?}"
+        );
+        assert!(
+            written.contains("[stderr] [omp] stderr start"),
+            "OMP stderr must be shown without verbose: {written:?}"
+        );
+        assert!(
+            written.contains("[stderr] [omp] stderr end"),
+            "OMP stderr must be shown without verbose: {written:?}"
+        );
+        // stdout logs keep stream order relative to the assistant text.
+        let log = written.find("omp plain stdout log").unwrap();
+        let answer = written.find("final answer").unwrap();
+        assert!(log < answer, "order: {written:?}");
+        // Logs never pollute the extracted assistant text.
+        assert_eq!(result.extracted_text, Some("final answer".to_string()));
+        assert!(
+            result.protocol_error.is_none(),
+            "log lines are not a protocol mismatch"
+        );
+        // Raw NDJSON still retained for loop post-processing.
+        assert!(result.output.contains("text_delta"));
     }
 
     #[tokio::test]

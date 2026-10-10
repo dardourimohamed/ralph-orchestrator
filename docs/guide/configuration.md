@@ -126,6 +126,7 @@ event_loop:
 cli:
   backend: "claude"                     # Backend name
   prompt_mode: "arg"                    # arg or stdin
+  show_thinking: false                  # Show backend thinking dimmed on console (RALPH_SHOW_THINKING=1)
 
 # Core behaviors
 core:
@@ -216,6 +217,7 @@ Backend configuration.
 |--------|------|---------|-------------|
 | `backend` | string | auto-detect | Backend name |
 | `prompt_mode` | string | `"arg"` | How prompt is passed |
+| `show_thinking` | boolean | `false` | Surface backend thinking blocks (Claude/Pi/OMP) in plain console output, rendered in a dimmed color to distinguish them from assistant text (TUI always shows thinking dimmed; also enabled by `RALPH_SHOW_THINKING=1`) |
 
 **Backend values:**
 - `claude` — Claude Code

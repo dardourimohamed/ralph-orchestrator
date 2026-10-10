@@ -215,6 +215,14 @@ pub enum RpcEvent {
         delta: String,
     },
 
+    /// Streaming thinking/reasoning delta from the agent.
+    ThinkingDelta {
+        /// Iteration number.
+        iteration: u32,
+        /// The thinking chunk.
+        delta: String,
+    },
+
     /// A tool invocation is starting.
     ToolCallStart {
         /// Iteration number.

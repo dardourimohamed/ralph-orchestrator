@@ -155,7 +155,7 @@ impl PtyConfig {
 /// context. We track peak for input/cache fields and sum only `output_tokens`
 /// (new tokens produced per turn never overlap).
 #[derive(Debug, Default)]
-struct ClaudeSessionState {
+pub(crate) struct ClaudeSessionState {
     peak_input: u64,
     total_output: u64,
     peak_cache_read: u64,
@@ -163,7 +163,7 @@ struct ClaudeSessionState {
 }
 
 impl ClaudeSessionState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 }
@@ -236,6 +236,10 @@ pub struct PtyExecutor {
     // This replaces the previous inference via output_rx.is_none() which broke
     // after the streaming refactor (handle() is no longer called in TUI mode).
     tui_mode: bool,
+    // Surface backend thinking blocks in plain console output. Set via
+    // set_show_thinking() from `cli.show_thinking` or RALPH_SHOW_THINKING=1.
+    // In TUI mode thinking is always shown regardless of this flag.
+    show_thinking: bool,
     // Resolved context-window ceiling in tokens. Threaded into SessionResult
     // so downstream renderers can compute the `Context: NN% (KK/200K)` suffix.
     // Defaults to 0 (suppresses the suffix when unset by the caller).
@@ -262,6 +266,7 @@ impl PtyExecutor {
             terminated_tx,
             terminated_rx: Some(terminated_rx),
             tui_mode: false,
+            show_thinking: false,
             context_window: 0,
         }
     }
@@ -285,6 +290,11 @@ impl PtyExecutor {
     /// * `enabled` - Whether TUI mode should be active
     pub fn set_tui_mode(&mut self, enabled: bool) {
         self.tui_mode = enabled;
+    }
+
+    /// Enables or disables console display of backend thinking blocks.
+    pub fn set_show_thinking(&mut self, enabled: bool) {
+        self.show_thinking = enabled;
     }
 
     /// Updates the backend configuration for this executor.
@@ -681,8 +691,10 @@ impl PtyExecutor {
             output_format,
             OutputFormat::PiStreamJson | OutputFormat::OmpStreamJson
         );
-        // Pi-family thinking deltas are noisy for plain console output but useful in TUI.
-        let show_pi_thinking = is_pi_family_stream && self.tui_mode;
+        // Thinking blocks are noisy for plain console output but useful in
+        // TUI. Console display can be enabled via cli.show_thinking or
+        // RALPH_SHOW_THINKING=1 (set_show_thinking).
+        let show_thinking = self.tui_mode || self.show_thinking;
         // Presentation label derived from the output flavor (not the command) so
         // a command override keeps the correct Pi/OMP identity (design §5).
         let pi_family_label: &'static str = match output_format {
@@ -845,6 +857,7 @@ impl PtyExecutor {
                                                 &mut extracted_text,
                                                 &mut claude_state,
                                                 context_window,
+                                                show_thinking,
                                             )
                                         {
                                             completion = Some(session_result);
@@ -874,7 +887,7 @@ impl PtyExecutor {
                                         let line = line_buffer[..newline_pos].to_string();
                                         line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-                                        family_state.process_line(&line, handler, show_pi_thinking);
+                                        family_state.process_line(&line, handler, show_thinking);
                                     }
                                 } else {
                                     // Text format: Stream raw output directly to handler
@@ -895,6 +908,7 @@ impl PtyExecutor {
                                     &mut extracted_text,
                                     &mut claude_state,
                                     context_window,
+                                    show_thinking,
                                 ) {
                                     completion = Some(session_result);
                                 }
@@ -909,7 +923,7 @@ impl PtyExecutor {
                                 }
                             } else if is_pi_family_stream && !line_buffer.is_empty() {
                                 family_state
-                                    .process_line(&line_buffer, handler, show_pi_thinking);
+                                    .process_line(&line_buffer, handler, show_thinking);
                             }
                             break;
                         }
@@ -965,6 +979,7 @@ impl PtyExecutor {
                                             &mut extracted_text,
                                             &mut claude_state,
                                             context_window,
+                                            show_thinking,
                                         )
                                     {
                                         completion = Some(session_result);
@@ -990,7 +1005,7 @@ impl PtyExecutor {
                                 while let Some(newline_pos) = line_buffer.find('\n') {
                                     let line = line_buffer[..newline_pos].to_string();
                                     line_buffer = line_buffer[newline_pos + 1..].to_string();
-                                    family_state.process_line(&line, handler, show_pi_thinking);
+                                    family_state.process_line(&line, handler, show_thinking);
                                 }
                             } else {
                                 // Text: stream raw output to handler
@@ -1025,6 +1040,7 @@ impl PtyExecutor {
                                                 &mut extracted_text,
                                                 &mut claude_state,
                                                 context_window,
+                                                show_thinking,
                                             )
                                         {
                                             completion = Some(session_result);
@@ -1048,7 +1064,7 @@ impl PtyExecutor {
                                     while let Some(newline_pos) = line_buffer.find('\n') {
                                         let line = line_buffer[..newline_pos].to_string();
                                         line_buffer = line_buffer[newline_pos + 1..].to_string();
-                                        family_state.process_line(&line, handler, show_pi_thinking);
+                                        family_state.process_line(&line, handler, show_thinking);
                                     }
                                 } else {
                                     // Text: stream raw output to handler
@@ -1075,6 +1091,7 @@ impl PtyExecutor {
                         &mut extracted_text,
                         &mut claude_state,
                         context_window,
+                        show_thinking,
                     )
                 {
                     completion = Some(session_result);
@@ -1088,7 +1105,7 @@ impl PtyExecutor {
                         completion = Some(session_result);
                     }
                 } else if is_pi_family_stream && !line_buffer.is_empty() {
-                    family_state.process_line(&line_buffer, handler, show_pi_thinking);
+                    family_state.process_line(&line_buffer, handler, show_thinking);
                 }
 
                 let final_termination = resolve_termination_type(exit_code, termination);
@@ -1914,12 +1931,13 @@ fn extract_cli_flag_value(args: &[String], long_flag: &str, short_flag: &str) ->
 ///
 /// Returns `Some(SessionResult)` when the event is `Result` — the caller
 /// persists it to feed `build_result`. Returns `None` for all other events.
-fn dispatch_stream_event<H: StreamHandler>(
+pub(crate) fn dispatch_stream_event<H: StreamHandler>(
     event: ClaudeStreamEvent,
     handler: &mut H,
     extracted_text: &mut String,
     state: &mut ClaudeSessionState,
     context_window: u64,
+    show_thinking: bool,
 ) -> Option<SessionResult> {
     match event {
         ClaudeStreamEvent::System { .. } => {
@@ -1946,6 +1964,13 @@ fn dispatch_stream_event<H: StreamHandler>(
                         // Accumulate text for event parsing
                         extracted_text.push_str(&text);
                         extracted_text.push('\n');
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        if show_thinking {
+                            handler.on_thinking(&thinking);
+                        }
+                        // Thinking never enters extracted_text (the
+                        // event-parse source); display only.
                     }
                     ContentBlock::ToolUse { name, id, input } => {
                         handler.on_tool_call(&name, &id, &input)
@@ -2299,6 +2324,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingHandler {
         texts: Vec<String>,
+        thinkings: Vec<String>,
         tool_calls: Vec<(String, String, serde_json::Value)>,
         tool_results: Vec<(String, String)>,
         errors: Vec<String>,
@@ -2308,6 +2334,10 @@ mod tests {
     impl StreamHandler for CapturingHandler {
         fn on_text(&mut self, text: &str) {
             self.texts.push(text.to_string());
+        }
+
+        fn on_thinking(&mut self, text: &str) {
+            self.thinkings.push(text.to_string());
         }
 
         fn on_tool_call(&mut self, name: &str, id: &str, input: &serde_json::Value) {
@@ -2356,6 +2386,7 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             0,
+            false,
         );
 
         assert!(result.is_none());
@@ -2388,6 +2419,7 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             0,
+            false,
         );
         assert!(result.is_none());
         assert_eq!(handler.tool_results.len(), 1);
@@ -2407,11 +2439,70 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             0,
+            false,
         );
         assert!(result.is_some());
         assert_eq!(handler.errors.len(), 1);
         assert_eq!(handler.completions.len(), 1);
         assert!(handler.completions[0].is_error);
+    }
+
+    #[test]
+    fn test_dispatch_stream_event_thinking_gated_and_excluded() {
+        let make_event = || ClaudeStreamEvent::Assistant {
+            message: AssistantMessage {
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "SECRET_THINKING".to_string(),
+                        signature: Some("sig".to_string()),
+                    },
+                    ContentBlock::Text {
+                        text: "final answer".to_string(),
+                    },
+                ],
+                usage: None,
+            },
+        };
+
+        // Hidden by default: only text is shown; thinking never
+        // enters extracted_text.
+        let mut handler = CapturingHandler::default();
+        let mut extracted_text = String::new();
+        let mut claude_state = ClaudeSessionState::new();
+        let result = dispatch_stream_event(
+            make_event(),
+            &mut handler,
+            &mut extracted_text,
+            &mut claude_state,
+            0,
+            false,
+        );
+        assert!(result.is_none());
+        assert_eq!(handler.texts, vec!["final answer".to_string()]);
+        assert!(
+            handler.thinkings.is_empty(),
+            "thinking must not be surfaced when hidden"
+        );
+        assert!(extracted_text.contains("final answer"));
+        assert!(!extracted_text.contains("SECRET_THINKING"));
+
+        // Shown when enabled: thinking is routed through on_thinking,
+        // and still never enters extracted_text.
+        let mut handler = CapturingHandler::default();
+        let mut extracted_text = String::new();
+        let mut claude_state = ClaudeSessionState::new();
+        dispatch_stream_event(
+            make_event(),
+            &mut handler,
+            &mut extracted_text,
+            &mut claude_state,
+            0,
+            true,
+        );
+        assert_eq!(handler.texts, vec!["final answer".to_string()]);
+        assert_eq!(handler.thinkings, vec!["SECRET_THINKING".to_string()]);
+        assert!(extracted_text.contains("final answer"));
+        assert!(!extracted_text.contains("SECRET_THINKING"));
     }
 
     #[test]
@@ -2432,6 +2523,7 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             0,
+            false,
         );
 
         assert!(result.is_none());
@@ -2470,6 +2562,7 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             0,
+            false,
         );
         assert_eq!(claude_state.peak_input, 1150);
         assert_eq!(claude_state.total_output, 20);
@@ -2494,6 +2587,7 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             0,
+            false,
         );
         assert_eq!(claude_state.peak_input, 4310);
         // Output sums; caches keep max.
@@ -2519,6 +2613,7 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             0,
+            false,
         );
         assert_eq!(claude_state.peak_input, 4310);
         assert_eq!(claude_state.total_output, 65);
@@ -2538,6 +2633,7 @@ mod tests {
             &mut extracted_text,
             &mut claude_state,
             200_000,
+            false,
         )
         .expect("Result event must yield SessionResult");
         assert_eq!(session.input_tokens, 4310);
@@ -2581,6 +2677,7 @@ mod tests {
                 &mut extracted_text,
                 &mut claude_state,
                 200_000,
+                false,
             );
             if maybe_session.is_some() {
                 last_session = maybe_session;
@@ -2671,6 +2768,30 @@ mod tests {
         assert!(
             !executor.tui_mode,
             "tui_mode should be false after set_tui_mode(false)"
+        );
+    }
+
+    #[test]
+    fn test_show_thinking_default_and_setter() {
+        let backend = CliBackend::claude();
+        let config = PtyConfig::default();
+        let mut executor = PtyExecutor::new(backend, config);
+
+        assert!(
+            !executor.show_thinking,
+            "show_thinking should default to false"
+        );
+
+        executor.set_show_thinking(true);
+        assert!(
+            executor.show_thinking,
+            "show_thinking should be true after set_show_thinking(true)"
+        );
+
+        executor.set_show_thinking(false);
+        assert!(
+            !executor.show_thinking,
+            "show_thinking should be false after set_show_thinking(false)"
         );
     }
 

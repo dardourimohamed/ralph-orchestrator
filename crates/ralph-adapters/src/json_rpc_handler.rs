@@ -104,6 +104,16 @@ impl<W: Write + Send> StreamHandler for JsonRpcStreamHandler<W> {
         });
     }
 
+    fn on_thinking(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.emit(RpcEvent::ThinkingDelta {
+            iteration: self.iteration,
+            delta: text.to_string(),
+        });
+    }
+
     fn on_tool_call(&mut self, name: &str, id: &str, input: &Value) {
         // Track start time for duration calculation
         self.tool_start_times.insert(id.to_string(), Instant::now());
@@ -205,6 +215,29 @@ mod tests {
         assert_eq!(json["type"], "text_delta");
         assert_eq!(json["iteration"], 3);
         assert_eq!(json["delta"], "hello world");
+    }
+
+    #[test]
+    fn test_thinking_delta_event() {
+        let (mut handler, buffer) = capture_handler();
+
+        handler.on_thinking("secret thinking");
+
+        let output = get_output(&buffer);
+        let json = parse_json_line(output.trim());
+
+        assert_eq!(json["type"], "thinking_delta");
+        assert_eq!(json["iteration"], 3);
+        assert_eq!(json["delta"], "secret thinking");
+
+        // Empty thinking emits nothing.
+        handler.on_thinking("");
+        let output = get_output(&buffer);
+        assert_eq!(
+            output.lines().count(),
+            1,
+            "empty thinking must not emit an event: {output:?}"
+        );
     }
 
     #[test]

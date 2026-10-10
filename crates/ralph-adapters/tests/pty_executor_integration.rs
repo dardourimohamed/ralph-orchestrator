@@ -9,6 +9,7 @@ mod pty_executor_integration {
     #[derive(Default)]
     struct CapturingHandler {
         texts: Vec<String>,
+        thinkings: Vec<String>,
         tool_calls: Vec<(String, String, serde_json::Value)>,
         tool_results: Vec<(String, String)>,
         errors: Vec<String>,
@@ -18,6 +19,10 @@ mod pty_executor_integration {
     impl StreamHandler for CapturingHandler {
         fn on_text(&mut self, text: &str) {
             self.texts.push(text.to_string());
+        }
+
+        fn on_thinking(&mut self, text: &str) {
+            self.thinkings.push(text.to_string());
         }
 
         fn on_tool_call(&mut self, name: &str, id: &str, input: &serde_json::Value) {
@@ -287,6 +292,7 @@ mod pty_executor_integration {
             "thinking must be hidden without TUI: {:?}",
             handler.texts
         );
+        assert!(handler.thinkings.is_empty());
         assert!(handler.texts.iter().any(|t| t.contains("final answer")));
         // extracted_text (used for event parsing) holds assistant text only.
         assert_eq!(result.extracted_text, "final answer");
@@ -326,15 +332,129 @@ mod pty_executor_integration {
             .expect("run_observe_streaming");
 
         assert!(result.success);
-        // In TUI mode the thinking delta IS surfaced to the handler ...
+        // In TUI mode the thinking delta IS surfaced via on_thinking ...
         assert!(
-            handler.texts.iter().any(|t| t.contains("thinking text")),
+            handler
+                .thinkings
+                .iter()
+                .any(|t| t.contains("thinking text")),
             "thinking must be shown in TUI mode: {:?}",
-            handler.texts
+            handler.thinkings
         );
         // ... but extracted_text (used for event parsing) holds assistant text
         // only, never thinking.
         assert_eq!(result.extracted_text, "final answer");
+    }
+
+    #[tokio::test]
+    async fn run_observe_streaming_pi_thinking_shown_with_console_flag() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let backend = CliBackend {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string()],
+            prompt_mode: PromptMode::Arg,
+            prompt_flag: None,
+            output_format: OutputFormat::PiStreamJson,
+            env_vars: vec![],
+        };
+        let config = PtyConfig {
+            interactive: false,
+            idle_timeout_secs: 0,
+            cols: 80,
+            rows: 24,
+            workspace_root: temp_dir.path().to_path_buf(),
+        };
+        let mut executor = PtyExecutor::new(backend, config);
+        executor.set_show_thinking(true);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut handler = CapturingHandler::default();
+
+        let script = r#"printf '%s\n' \
+'{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"thinking text"}}' \
+'{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"final answer"}}' \
+'{"type":"turn_end","message":{"role":"assistant","content":[],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.01}},"stopReason":"stop"}}'"#;
+
+        let result = executor
+            .run_observe_streaming(script, rx, &mut handler)
+            .await
+            .expect("run_observe_streaming");
+
+        assert!(result.success);
+        // With the console flag (no TUI) the thinking delta IS surfaced
+        // via on_thinking ...
+        assert!(
+            handler
+                .thinkings
+                .iter()
+                .any(|t| t.contains("thinking text")),
+            "thinking must be shown with console flag: {:?}",
+            handler.thinkings
+        );
+        // ... but extracted_text (used for event parsing) holds assistant
+        // text only, never thinking.
+        assert_eq!(result.extracted_text, "final answer");
+    }
+
+    #[tokio::test]
+    async fn run_observe_streaming_claude_thinking_gated_with_console_flag() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let backend = CliBackend {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string()],
+            prompt_mode: PromptMode::Arg,
+            prompt_flag: None,
+            output_format: OutputFormat::StreamJson,
+            env_vars: vec![],
+        };
+        let config = PtyConfig {
+            interactive: false,
+            idle_timeout_secs: 0,
+            cols: 80,
+            rows: 24,
+            workspace_root: temp_dir.path().to_path_buf(),
+        };
+        let script = r#"printf '%s\n' \
+'{"type":"system","session_id":"s1","model":"m","tools":[]}' \
+'{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"thinking text","signature":"sig"},{"type":"text","text":"final answer"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}' \
+'{"type":"result","duration_ms":5,"total_cost_usd":0.01,"num_turns":1,"is_error":false}'"#;
+
+        // Default: thinking hidden from the handler; extracted is text only.
+        let executor = PtyExecutor::new(backend.clone(), config.clone());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut handler = CapturingHandler::default();
+        let result = executor
+            .run_observe_streaming(script, rx, &mut handler)
+            .await
+            .expect("run_observe_streaming");
+        assert!(result.success);
+        assert!(
+            !handler.texts.iter().any(|t| t.contains("thinking text")),
+            "thinking must be hidden without the console flag: {:?}",
+            handler.texts
+        );
+        assert!(handler.thinkings.is_empty());
+        assert!(handler.texts.iter().any(|t| t.contains("final answer")));
+        assert_eq!(result.extracted_text, "final answer\n");
+
+        // Console flag: thinking surfaced to the handler, still not extracted.
+        let mut executor = PtyExecutor::new(backend, config);
+        executor.set_show_thinking(true);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut handler = CapturingHandler::default();
+        let result = executor
+            .run_observe_streaming(script, rx, &mut handler)
+            .await
+            .expect("run_observe_streaming");
+        assert!(result.success);
+        assert!(
+            handler
+                .thinkings
+                .iter()
+                .any(|t| t.contains("thinking text")),
+            "thinking must be shown with the console flag: {:?}",
+            handler.thinkings
+        );
+        assert_eq!(result.extracted_text, "final answer\n");
     }
 
     #[tokio::test]

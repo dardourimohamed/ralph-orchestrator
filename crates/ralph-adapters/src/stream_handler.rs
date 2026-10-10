@@ -9,7 +9,7 @@ use crossterm::{
     style::{self, Color},
 };
 use ratatui::{
-    style::{Color as RatatuiColor, Style},
+    style::{Color as RatatuiColor, Modifier, Style},
     text::{Line, Span},
 };
 use std::{
@@ -165,6 +165,23 @@ impl StreamHandler for PrettyStreamHandler {
         self.text_buffer.push_str(text);
     }
 
+    fn on_thinking(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Flush buffered assistant text first, then render the thinking
+        // block (markdown, like assistant text) in a dimmed color so it
+        // reads as reasoning rather than the agent's answer.
+        self.flush_text_buffer();
+        let rendered = self.skin.term_text(text).to_string();
+        let _ = self
+            .stdout
+            .queue(style::SetForegroundColor(Color::DarkGrey));
+        let _ = self.stdout.write(rendered.as_bytes());
+        let _ = self.stdout.queue(style::ResetColor);
+        let _ = self.stdout.flush();
+    }
+
     fn on_tool_result(&mut self, _id: &str, output: &str) {
         if self.verbose {
             let _ = self
@@ -233,6 +250,21 @@ pub trait StreamHandler: Send {
     /// Called when Claude emits text.
     fn on_text(&mut self, text: &str);
 
+    /// Called when the backend emits a thinking/reasoning block.
+    ///
+    /// Default implementation falls back to [`StreamHandler::on_text`];
+    /// display implementations should render thinking dimmed so it is
+    /// visually distinct from assistant output.
+    fn on_thinking(&mut self, text: &str) {
+        self.on_text(text);
+    }
+
+    /// Called for backend log lines that are not part of the structured
+    /// stream (e.g. a backend writing human logs into its NDJSON stdout).
+    ///
+    /// Default: ignore.
+    fn on_log(&mut self, _line: &str) {}
+
     /// Called when Claude invokes a tool.
     ///
     /// # Arguments
@@ -250,6 +282,60 @@ pub trait StreamHandler: Send {
     /// Called when session completes (verbose only).
     fn on_complete(&mut self, result: &SessionResult);
 }
+/// Tracks a thinking block being streamed to a console writer so thinking
+/// reads as a labeled, dimmed block instead of inline text:
+///
+/// - open: dimmed cyan `[thinking]` label in front of the first chunk
+/// - body: streamed in full (dimmed dark grey, no truncation)
+/// - close: dimmed separator line before the next non-thinking output or
+///   end of stream
+///
+/// State is owned by the executor scope and handed to the per-line
+/// handlers, because console handlers are constructed per stream line.
+#[derive(Default)]
+pub(crate) struct ThinkingBlock {
+    open: bool,
+}
+
+impl ThinkingBlock {
+    /// Streams a thinking chunk, opening the block on the first chunk.
+    ///
+    /// Dim is emitted after each foreground setter: when crossterm's
+    /// process-wide `NO_COLOR` gate is active, color setters emit empty
+    /// payloads (`ESC[m` resets) that would otherwise wipe a Dim set before
+    /// them; trailing Dim keeps the block dimmed in both modes.
+    pub(crate) fn write<W: Write>(&mut self, writer: &mut W, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.open {
+            self.open = true;
+            let _ = writer.queue(style::SetForegroundColor(Color::Cyan));
+            let _ = writer.queue(style::SetAttribute(style::Attribute::Dim));
+            let _ = write!(writer, "\n[thinking] ");
+            let _ = writer.queue(style::SetForegroundColor(Color::DarkGrey));
+            let _ = writer.queue(style::SetAttribute(style::Attribute::Dim));
+        }
+        let _ = writer.write_all(text.as_bytes());
+    }
+
+    /// Closes an open block with a dimmed separator line. Returns whether a
+    /// block was closed (output always ends on a fresh line, so callers can
+    /// update their line-state tracking).
+    pub(crate) fn close<W: Write>(&mut self, writer: &mut W) -> bool {
+        if !self.open {
+            return false;
+        }
+        self.open = false;
+        let _ = writer.queue(style::ResetColor);
+        let _ = writeln!(writer);
+        let _ = writer.queue(style::SetForegroundColor(Color::DarkGrey));
+        let _ = writer.queue(style::SetAttribute(style::Attribute::Dim));
+        let _ = writeln!(writer, "└{}", "─".repeat(44));
+        let _ = writer.queue(style::ResetColor);
+        true
+    }
+}
 
 /// Writes streaming output to stdout/stderr.
 ///
@@ -261,6 +347,8 @@ pub struct ConsoleStreamHandler {
     stderr: io::Stderr,
     /// Tracks whether last output ended with a newline
     last_was_newline: bool,
+    /// Open/close state for the thinking block rendered to stdout.
+    thinking: ThinkingBlock,
 }
 
 impl ConsoleStreamHandler {
@@ -274,6 +362,7 @@ impl ConsoleStreamHandler {
             stdout: io::stdout(),
             stderr: io::stderr(),
             last_was_newline: true, // Start true so first output doesn't get extra newline
+            thinking: ThinkingBlock::default(),
         }
     }
 
@@ -284,16 +373,42 @@ impl ConsoleStreamHandler {
             self.last_was_newline = true;
         }
     }
+
+    /// Closes an open thinking block, keeping line-state tracking accurate:
+    /// a close always ends on a fresh line.
+    fn close_thinking(&mut self) {
+        if self.thinking.close(&mut self.stdout) {
+            self.last_was_newline = true;
+        }
+    }
 }
 
 impl StreamHandler for ConsoleStreamHandler {
     fn on_text(&mut self, text: &str) {
+        self.close_thinking();
         let _ = write!(self.stdout, "{}", text);
         let _ = self.stdout.flush();
         self.last_was_newline = text.ends_with('\n');
     }
 
+    fn on_thinking(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.thinking.write(&mut self.stdout, text);
+        let _ = self.stdout.flush();
+        self.last_was_newline = text.ends_with('\n');
+    }
+
+    fn on_log(&mut self, line: &str) {
+        self.close_thinking();
+        self.ensure_newline();
+        let _ = writeln!(self.stdout, "{}", line);
+        self.last_was_newline = true;
+    }
+
     fn on_tool_call(&mut self, name: &str, _id: &str, input: &serde_json::Value) {
+        self.close_thinking();
         self.ensure_newline();
         match format_tool_summary(name, input) {
             Some(summary) => {
@@ -308,18 +423,23 @@ impl StreamHandler for ConsoleStreamHandler {
     }
 
     fn on_tool_result(&mut self, _id: &str, output: &str) {
+        self.close_thinking();
+        self.ensure_newline();
         if self.verbose {
             let _ = writeln!(self.stdout, "[Result] {}", truncate(output, 200));
+            self.last_was_newline = true;
         }
     }
 
     fn on_error(&mut self, error: &str) {
         // Write to both stdout (inline) and stderr (for separation)
+        self.close_thinking();
         let _ = writeln!(self.stdout, "[Error] {}", error);
         let _ = writeln!(self.stderr, "[Error] {}", error);
     }
 
     fn on_complete(&mut self, result: &SessionResult) {
+        self.close_thinking();
         if self.verbose {
             let _ = writeln!(
                 self.stdout,
@@ -408,7 +528,8 @@ fn text_to_lines(text: &str) -> Vec<Line<'static>> {
 enum ContentBlock {
     /// Markdown/ANSI text that was accumulated before being frozen
     Text(String),
-    /// A single non-text line (tool call, error, completion summary, etc.)
+    /// Thinking block, rendered dimmed in the TUI.
+    Thinking(String),
     NonText(Line<'static>),
 }
 
@@ -496,6 +617,21 @@ impl TuiStreamHandler {
                 ContentBlock::Text(text) => {
                     all_lines.extend(text_to_lines(text));
                 }
+                ContentBlock::Thinking(text) => {
+                    all_lines.extend(text_to_lines(text).into_iter().map(|line| {
+                        let spans: Vec<Span<'static>> = line
+                            .spans
+                            .into_iter()
+                            .map(|span| {
+                                Span::styled(
+                                    span.content.into_owned(),
+                                    span.style.add_modifier(Modifier::DIM),
+                                )
+                            })
+                            .collect();
+                        Line::from(spans)
+                    }));
+                }
                 ContentBlock::NonText(line) => {
                     all_lines.push(line.clone());
                 }
@@ -531,6 +667,17 @@ impl StreamHandler for TuiStreamHandler {
 
         // Re-parse and update lines on each text chunk
         // This handles streaming markdown correctly
+        self.update_lines();
+    }
+
+    fn on_thinking(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Thinking gets its own dimmed block (not merged into the
+        // assistant text buffer) so it stays visually distinct.
+        self.freeze_current_text();
+        self.blocks.push(ContentBlock::Thinking(text.to_string()));
         self.update_lines();
     }
 
@@ -622,6 +769,36 @@ fn truncate(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_thinking_block_exact_sgr_bytes() {
+        // Pins the exact byte stream of open + body + close so styling
+        // regressions (lost attributes, out-of-order SGR) are caught.
+        // crossterm's process-wide NO_COLOR gate is read, not touched: when
+        // active (NO_COLOR set in the environment), foreground setters emit
+        // empty payloads (`ESC[m` resets) and only the Dim attributes remain.
+        let color_off = crossterm::style::Colored::ansi_color_disabled_memoized();
+        let (label, body) = if color_off {
+            ("\u{1b}[m", "\u{1b}[m")
+        } else {
+            ("\u{1b}[38;5;14m", "\u{1b}[38;5;8m")
+        };
+
+        let mut block = ThinkingBlock::default();
+        let mut buf: Vec<u8> = Vec::new();
+        block.write(&mut buf, "abc");
+        assert!(block.close(&mut buf), "open block must close");
+
+        let s = String::from_utf8_lossy(&buf).to_string();
+        assert_eq!(
+            s,
+            format!(
+                "{label}\u{1b}[2m\n[thinking] {body}\u{1b}[2mabc\u{1b}[0m\n{body}\u{1b}[2m└{}\n\u{1b}[0m",
+                "─".repeat(44)
+            ),
+            "unexpected ThinkingBlock byte stream"
+        );
+    }
 
     #[test]
     fn test_console_handler_verbose_shows_results() {
@@ -887,6 +1064,45 @@ mod tests {
             handler.lines.lock().unwrap().clone()
         }
 
+        #[test]
+        fn test_tui_handler_thinking_rendered_dimmed() {
+            // Given a TUI handler that already has assistant text
+            let mut handler = TuiStreamHandler::new(false);
+            handler.on_text("answer text\n");
+
+            // When a thinking block arrives
+            handler.on_thinking("inner reasoning\n");
+
+            // Then the thinking line is dimmed and the assistant text is not
+            let lines = collect_lines(&handler);
+            let thinking_line = lines
+                .iter()
+                .find(|l| {
+                    l.spans
+                        .iter()
+                        .any(|s| s.content.contains("inner reasoning"))
+                })
+                .expect("thinking line should be present");
+            assert!(
+                thinking_line
+                    .spans
+                    .iter()
+                    .all(|s| s.style.has_modifier(Modifier::DIM)),
+                "thinking spans should be DIM: {:?}",
+                thinking_line.spans
+            );
+            let answer_line = lines
+                .iter()
+                .find(|l| l.spans.iter().any(|s| s.content.contains("answer text")))
+                .expect("answer line should be present");
+            assert!(
+                answer_line
+                    .spans
+                    .iter()
+                    .all(|s| !s.style.has_modifier(Modifier::DIM)),
+                "assistant text must not be dimmed"
+            );
+        }
         #[test]
         fn text_creates_line_on_newline() {
             // Given TuiStreamHandler

@@ -1284,6 +1284,14 @@ pub struct CliConfig {
     /// If None, defaults to "-p" for arg mode.
     #[serde(default)]
     pub prompt_flag: Option<String>,
+
+    /// Surface backend thinking/reasoning blocks in plain console output
+    /// (pi/omp `thinking_delta` NDJSON, Claude stream-json `thinking`
+    /// content blocks). In TUI mode thinking is always shown; this only
+    /// affects console runs.
+    /// Also enabled by the `RALPH_SHOW_THINKING=1` environment variable.
+    #[serde(default)]
+    pub show_thinking: bool,
 }
 
 fn default_backend() -> String {
@@ -1312,6 +1320,7 @@ impl Default for CliConfig {
             idle_timeout_secs: default_idle_timeout(),
             args: Vec::new(),
             prompt_flag: None,
+            show_thinking: false,
         }
     }
 }

@@ -1796,7 +1796,8 @@ pub async fn run_loop_impl(
                 )
                 .await
             } else {
-                let executor = CliExecutor::new(effective_backend.clone());
+                let mut executor = CliExecutor::new(effective_backend.clone());
+                executor.set_show_thinking(show_thinking_enabled(&config));
                 let result = executor
                     .execute(&prompt, stdout(), timeout, verbosity == Verbosity::Verbose)
                     .await?;
@@ -4297,6 +4298,12 @@ async fn execute_acp(
     })
 }
 
+/// Whether backend thinking blocks should be surfaced in plain console
+/// output: `cli.show_thinking` in ralph.yml or `RALPH_SHOW_THINKING=1`.
+fn show_thinking_enabled(config: &RalphConfig) -> bool {
+    config.cli.show_thinking || std::env::var("RALPH_SHOW_THINKING").is_ok_and(|v| v == "1")
+}
+
 async fn execute_pty(
     executor: Option<&mut PtyExecutor>,
     backend: &CliBackend,
@@ -4344,6 +4351,10 @@ async fn execute_pty(
     if tui_lines.is_some() {
         exec.set_tui_mode(true);
     }
+
+    // Surface backend thinking on plain console when enabled via
+    // `cli.show_thinking` or RALPH_SHOW_THINKING=1 (TUI already shows it).
+    exec.set_show_thinking(show_thinking_enabled(config));
 
     // Resolved context-window ceiling (tokens) is threaded into SessionResult so
     // downstream renderers can show `Context: NN% (KK/200K)`. Re-resolved each
@@ -6257,6 +6268,8 @@ fn extract_readable_delta(line: &str, output_format: BackendOutputFormat) -> Opt
                             ContentBlock::ToolUse { name, input, .. } => {
                                 text.push_str(&format!("⚙ {name}({input})\n"));
                             }
+                            // Thinking is not a readable delta.
+                            ContentBlock::Thinking { .. } => {}
                         }
                     }
                     if text.is_empty() { None } else { Some(text) }

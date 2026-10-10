@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tracing::{debug, warn};
@@ -139,10 +139,13 @@ struct TextAccumulator {
     blocks: Vec<ContentBlock>,
     /// Current unfrozen text buffer.
     current_text: String,
+    /// Current unfrozen thinking buffer (rendered dimmed).
+    current_thinking: String,
 }
 
 enum ContentBlock {
     Text(String),
+    Thinking(String),
     NonText(Line<'static>),
 }
 
@@ -172,12 +175,28 @@ impl TextAccumulator {
         Self {
             blocks: Vec::new(),
             current_text: String::new(),
+            current_thinking: String::new(),
         }
     }
 
     /// Append a text delta and re-render all lines into the buffer.
     fn push_text(&mut self, delta: &str, lines_handle: &Arc<Mutex<Vec<Line<'static>>>>) {
+        if !self.current_thinking.is_empty() {
+            self.blocks.push(ContentBlock::Thinking(std::mem::take(
+                &mut self.current_thinking,
+            )));
+        }
         self.current_text.push_str(delta);
+        self.rebuild_lines(lines_handle);
+    }
+
+    /// Append a thinking delta (rendered dimmed) and re-render.
+    fn push_thinking(&mut self, delta: &str, lines_handle: &Arc<Mutex<Vec<Line<'static>>>>) {
+        if !self.current_text.is_empty() {
+            self.blocks
+                .push(ContentBlock::Text(std::mem::take(&mut self.current_text)));
+        }
+        self.current_thinking.push_str(delta);
         self.rebuild_lines(lines_handle);
     }
 
@@ -191,6 +210,11 @@ impl TextAccumulator {
             self.blocks
                 .push(ContentBlock::Text(std::mem::take(&mut self.current_text)));
         }
+        if !self.current_thinking.is_empty() {
+            self.blocks.push(ContentBlock::Thinking(std::mem::take(
+                &mut self.current_thinking,
+            )));
+        }
         self.blocks.push(ContentBlock::NonText(line));
         self.rebuild_lines(lines_handle);
     }
@@ -199,6 +223,7 @@ impl TextAccumulator {
     fn reset(&mut self) {
         self.blocks.clear();
         self.current_text.clear();
+        self.current_thinking.clear();
     }
 
     /// Re-render all accumulated content into the shared lines buffer.
@@ -207,16 +232,42 @@ impl TextAccumulator {
         for block in &self.blocks {
             match block {
                 ContentBlock::Text(t) => all_lines.extend(text_to_lines(t)),
+                ContentBlock::Thinking(t) => {
+                    all_lines.extend(dim_lines(&text_to_lines(t)));
+                }
                 ContentBlock::NonText(l) => all_lines.push(l.clone()),
             }
         }
         if !self.current_text.is_empty() {
             all_lines.extend(text_to_lines(&self.current_text));
         }
+        if !self.current_thinking.is_empty() {
+            all_lines.extend(dim_lines(&text_to_lines(&self.current_thinking)));
+        }
         if let Ok(mut buf) = lines_handle.lock() {
             *buf = all_lines;
         }
     }
+}
+
+/// Applies `Modifier::DIM` to every span, rendering lines as dimmed gray.
+fn dim_lines(lines: &[Line<'static>]) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .iter()
+                .map(|span| {
+                    Span::styled(
+                        span.content.to_string(),
+                        span.style.add_modifier(Modifier::DIM),
+                    )
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Applies an RPC event to the TUI state.
@@ -290,6 +341,15 @@ fn apply_rpc_event(event: &RpcEvent, state: &Arc<Mutex<TuiState>>, acc: &mut Tex
             }
 
             s.last_event = Some("text_delta".to_string());
+            s.last_event_at = Some(Instant::now());
+        }
+
+        RpcEvent::ThinkingDelta { delta, .. } => {
+            if let Some(handle) = s.latest_iteration_lines_handle() {
+                acc.push_thinking(delta, &handle);
+            }
+
+            s.last_event = Some("thinking_delta".to_string());
             s.last_event_at = Some(Instant::now());
         }
 
@@ -663,6 +723,65 @@ mod tests {
         let s = state.lock().unwrap();
         let lines = s.iterations[0].lines.lock().unwrap();
         assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn test_thinking_delta_rendered_dimmed() {
+        let state = make_state();
+        let mut acc = make_acc();
+
+        let start_event = RpcEvent::IterationStart {
+            iteration: 1,
+            max_iterations: None,
+            hat: "builder".to_string(),
+            hat_display: "🔨Builder".to_string(),
+            backend: "omp".to_string(),
+            started_at: 0,
+        };
+        apply_rpc_event(&start_event, &state, &mut acc);
+
+        let thinking_event = RpcEvent::ThinkingDelta {
+            iteration: 1,
+            delta: "secret thinking".to_string(),
+        };
+        apply_rpc_event(&thinking_event, &state, &mut acc);
+
+        let text_event = RpcEvent::TextDelta {
+            iteration: 1,
+            delta: "final answer".to_string(),
+        };
+        apply_rpc_event(&text_event, &state, &mut acc);
+
+        let s = state.lock().unwrap();
+        let lines = s.iterations[0].lines.lock().unwrap();
+        let thinking_lines: Vec<_> = lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .any(|sp| sp.content.contains("secret thinking"))
+            })
+            .collect();
+        assert_eq!(thinking_lines.len(), 1);
+        for span in &thinking_lines[0].spans {
+            assert!(
+                span.style.has_modifier(Modifier::DIM),
+                "thinking span must be dimmed: {:?}",
+                span
+            );
+        }
+        let text_lines: Vec<_> = lines
+            .iter()
+            .filter(|l| l.spans.iter().any(|sp| sp.content.contains("final answer")))
+            .collect();
+        assert_eq!(text_lines.len(), 1);
+        assert!(
+            text_lines[0]
+                .spans
+                .iter()
+                .all(|sp| !sp.style.has_modifier(Modifier::DIM)),
+            "assistant text must not be dimmed"
+        );
     }
 
     #[test]

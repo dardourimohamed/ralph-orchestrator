@@ -56,6 +56,14 @@ pub struct UserMessage {
 pub enum ContentBlock {
     /// Plain text output from Claude.
     Text { text: String },
+    /// Extended thinking block (present when the model reasons before
+    /// responding). Carried for display only; never enters extracted text.
+    Thinking {
+        thinking: String,
+        /// Cryptographic signature emitted by Claude; absent in some payloads.
+        #[serde(default)]
+        signature: Option<String>,
+    },
     /// Tool invocation by Claude.
     ToolUse {
         id: String,
@@ -170,6 +178,7 @@ mod tests {
                 match &message.content[0] {
                     ContentBlock::Text { text } => assert_eq!(text, "Hello world"),
                     ContentBlock::ToolUse { .. } => panic!("Expected Text content"),
+                    ContentBlock::Thinking { .. } => panic!("Expected Text content"),
                 }
             }
             _ => panic!("Expected Assistant event"),
@@ -191,6 +200,7 @@ mod tests {
                         assert_eq!(input["command"], "ls");
                     }
                     ContentBlock::Text { .. } => panic!("Expected ToolUse content"),
+                    ContentBlock::Thinking { .. } => panic!("Expected ToolUse content"),
                 }
             }
             _ => panic!("Expected Assistant event"),
